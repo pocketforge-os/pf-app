@@ -54,7 +54,9 @@ my-app/
 ├── src/main.c             # a rectangle that turns green while a button is held
 ├── build.sh  Makefile  pins.env    # hermetic aarch64 cross-build
 ├── ci/run-under-sim.py    # the off-hardware proof (grey -> green on a button press)
-├── oci/build-oci.sh       # packaging stub (handed to the E8 packaging path)
+├── oci/                   # the packaging path: build-oci.sh + hermetic pinned toolchain
+│   │                      #   (Dockerfile.pack, pins-pack.env) + lib/ + slice.conf (see §7)
+│   └── ...
 ├── .github/workflows/app-smoke.yml   # advisory CI (build + sim)
 └── README.md  LICENSE  .gitignore
 ```
@@ -152,16 +154,41 @@ That's the whole loop: **scaffold → validate → build → run**, no device to
 - **CI** — `.github/workflows/app-smoke.yml` builds on every PR (portable) and runs the sim
   proof on the lab runner (advisory). Promote it to a required check once it's stable.
 
-## 7. Package (preview)
+## 7. Package (sign + scan, off-device)
 
 ```sh
-./oci/build-oci.sh          # stages the payload; STUB for now
+./oci/build-oci.sh          # build + dev-sign + scan + off-device verify
 ```
 
-Packaging is the E8 packaging path (`tsp-ziac.3`): `mmdebstrap → tar → OCI → cosign
-sign-by-digest → syft SBOM → grype scan`, producing the sibling files that ride beside
-`app.toml` in the installed bundle (`app.toml.sig`, `oci/`, `oci.sig`, `sbom.spdx.json`,
-`slice.conf`). The stub stages what you already own and marks each hand-off point.
+One command takes `build/<slug>.arm64` all the way to a **signed, scanned OCI bundle**:
+
+```
+mmdebstrap --format=tar → umoci OCI image-layout (BY DIGEST)
+  → cosign sign-by-digest (oci.sig)      → syft SBOM (sbom.spdx.json)
+  → minisign (app.toml.sig)              → grype vs a pinned DB (SEPARATE, non-blocking)
+  → off-device VERIFY (the exact checks the on-device supervisor will run)
+```
+
+It writes `dist/<slug>/` with the descriptor + the sibling files that ride beside `app.toml`
+in the installed bundle: `app.toml.sig`, `oci/`, `oci.sig`, `sbom.spdx.json`, `grype-report.json`,
+`slice.conf`. Details + the two-signature model live in [`oci/README.md`](../templates/app/oci/README.md.in).
+
+**Every tool runs at a sha256-pinned version inside a hermetic toolchain container**
+(`oci/Dockerfile.pack` + `oci/pins-pack.env`) so packaging is reproducible off any docker host.
+`apko` is **not** used — it can't consume Debian repos; mmdebstrap is the path. The **OCI is
+addressed by digest** and lands under `dist/` (gitignored) — **never commit it**; publishing by
+digest is distribution (E8.4).
+
+### Signing keys — dev vs release
+
+- **Default (`--dev`)** signs with a locally-generated dev keypair to **prove the mechanism**
+  off-device. This is not release signing.
+- **Release** signing uses the real PocketForge keys, which are **trust-tier / CI-OIDC-only**
+  (not author- or agent-readable). First-party apps are release-signed by the image repo's
+  `sign-and-scan` CI via GitHub OIDC. Your dev-signed bundle proves the shape CI will produce.
+
+The **on-silicon** supervisor verify+exec (both sigs, WITHOUT a reflash) is a separate,
+owner-gated hardware phase — not part of this off-device packaging step.
 
 ## Reference
 
