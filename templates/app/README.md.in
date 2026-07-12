@@ -1,0 +1,68 @@
+# {{APP_NAME}}
+
+A PocketForge app scaffolded by [`pf-app`](https://github.com/pocketforge-os/pf-app).
+It draws a rectangle and reads a button — the smallest honest app that exercises the whole
+PocketForge authoring loop: the capability facade, SDL3 via `SDL3_DYNAMIC_API`, and an
+off-hardware proof under the E5 simulator.
+
+## Architecture in one line
+
+`capabilities.toml` (device descriptor) → the E2 capability facade (`libpocketforge` C ABI:
+`pf_connect` / `pf_acquire`) → SDL3 (`libSDL3-pocketforge.so.0`, bound via `SDL3_DYNAMIC_API`)
+→ a software-rendered framebuffer. The app never opens `/dev/*` with ambient authority and
+never links a vendored device SDL3.
+
+- **Target family:** `{{FAMILY}}` (device `{{DEVICE}}`) — pinned in `app.toml` `[runtime]`.
+- **App id:** `{{APP_ID}}`.
+
+## Build (`./build.sh`)
+
+Hermetic aarch64 cross-build from the committed pins in [`pins.env`](pins.env):
+
+```sh
+./build.sh          # -> build/{{APP_SLUG}}.arm64   (needs docker + aarch64 cross-gcc)
+```
+
+It clones the pinned runtime (E2) + sim (E5) + platform (E1), cross-builds
+`libpocketforge.a` and a stock software-render `libSDL3.a`, then compiles the binary. The
+on-device SDL3 is swapped in at launch by [`launch`](launch) via `SDL_DYNAMIC_API` — never
+linked here.
+
+## Run under the E5 simulator (off-hardware proof)
+
+```sh
+./ci/run-under-sim.py \
+    --device {{DEVICE}} \
+    --binary   ./build/{{APP_SLUG}}.arm64 \
+    --sim      ./.cache/sim \
+    --platform ./.cache/platform \
+    --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \
+    --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \
+    --outdir   ./evidence/{{DEVICE}}
+```
+
+It boots the app, asserts the canvas-centre pixel is **grey** at rest, injects a real
+uinput button press, and asserts the pixel turns **green** — proving *draws + reads a
+button* end-to-end with no hardware. Run under `sg input -c '...'` (or sudo) for the
+uinput node. **On-device run is a separate, owner-gated hardware phase — not this.**
+
+## Validate the descriptor
+
+```sh
+pf app-validate app.toml   # from a pocketforge-os/platform checkout
+```
+
+## Package (stub → tsp-ziac.3)
+
+```sh
+./oci/build-oci.sh         # stages the payload; packaging/signing is the E8 packaging path
+```
+
+## Grow it
+
+Read the guide: **pocketforge-os/pf-app → `docs/BUILD-YOUR-OWN-APP.md`**. The reference app
+`pocketforge-os/pf-hwprobe` shows the data-driven, per-control-class widget pattern.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

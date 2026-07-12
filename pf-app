@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# pf-app — the PocketForge app-authoring CLI (E8 / tsp-ziac.2).
+#
+# ONE entrypoint for a PocketForge app author: scaffold a new, buildable, signable
+# SDL3-immediate-mode app that talks to the device through the capability facade
+# (libpocketforge) and links the platform SDL3 via SDL3_DYNAMIC_API — never raw /dev,
+# never a vendored SDL3. The emitted skeleton builds hermetically from committed pins
+# and runs off-hardware under the E5 simulator; the on-device run is a separate,
+# owner-gated hardware phase.
+#
+# Mirrors the platform repo's `pf` entrypoint pattern: a thin bash dispatcher over a
+# Python core (core/scaffold.py). Adding a subcommand is a case arm, not a rewrite.
+#
+# Subcommands:
+#   new <name> --device <a133|a523> [--id <app-id>] [--dir <path>] [--force]
+#                              scaffold a new app project (see `pf-app new --help`)
+#   help                       this text
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+PF_PY="${PF_PY:-python3}"
+
+usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-}"; [ "$#" -gt 0 ] && shift || true
+case "$cmd" in
+    new)          exec "$PF_PY" "$ROOT/core/scaffold.py" new "$@" ;;
+    ""|help|-h|--help) usage; exit 0 ;;
+    *) printf 'pf-app: unknown subcommand: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;
+esac
