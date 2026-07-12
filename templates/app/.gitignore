@@ -1,0 +1,7 @@
+# build + sim artifacts
+/build/
+/.cache/
+/evidence/
+/dist/
+*.o
+*.arm64

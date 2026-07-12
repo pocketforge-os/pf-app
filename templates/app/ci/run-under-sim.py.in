@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""run-under-sim.py — headless E5-sim proof of {{APP_SLUG}} (off-hardware acceptance).
+
+Drives the SAME {{APP_SLUG}}.arm64 binary under the E5 simulator harness (qemu-tsp +
+bubblewrap, no crun) against a device descriptor, and proves the two things the starter
+does end-to-end WITHOUT any hardware:
+
+  1. DRAWS   — boots, binds the capability facade, renders a frame -> the canvas-centre
+               pixel is GREY at rest.
+  2. READS A BUTTON — injects a real uinput button press through the sim control surface;
+               the app drains the event through the facade-authorized fd and re-renders
+               -> the canvas-centre pixel turns GREEN.
+
+The app never hits the tsp-osr renderer footgun (it software-renders off-screen). The
+a133/a523 delta is DATA (the descriptor), not code — same binary for both families.
+
+This wrapper only CONSUMES sim.control.control_surface.Device (read-only) and stages ONE
+input under --outdir (the copy of platform/devices/<id>/capabilities.toml the app reads
+via pf_connect_descriptor). Intended run host: modelmaker (mm@10.0.40.90).
+
+USAGE
+-----
+    ./ci/run-under-sim.py \\
+        --device {{DEVICE}} \\
+        --binary   ./build/{{APP_SLUG}}.arm64 \\
+        --sim      ./.cache/sim \\
+        --platform ./.cache/platform \\
+        --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \\
+        --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \\
+        --outdir   ./evidence/{{DEVICE}}
+
+Needs the uinput node (root-only): run under `sg input -c '...'` on a host whose user is
+in the `input` group, or under sudo. Exits non-zero with a printed diagnostic on any
+handshake / capture / colour-assertion failure.
+"""
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+
+def _import_sim(sim_dir: Path):
+    """Wire up sim's Python path the way sim itself does."""
+    for extra in ("synth", "fb", "sensor"):
+        sys.path.insert(0, str(sim_dir / extra))
+    sys.path.insert(0, str(sim_dir / "control"))
+    from control_surface import Device  # type: ignore[import-not-found]
+    from ppm2png import read_ppm         # type: ignore[import-not-found]
+    return Device, read_ppm
+
+
+def stage_descriptor(platform_dir: Path, device_id: str, outdir: Path) -> Path:
+    src = platform_dir / "devices" / device_id / "capabilities.toml"
+    if not src.is_file():
+        raise SystemExit(f"[run-under-sim] no descriptor at {src}")
+    outdir.mkdir(parents=True, exist_ok=True)
+    dst = outdir / "capabilities.toml"
+    shutil.copyfile(src, dst)
+    return dst
+
+
+def centre_pixel(read_ppm, ppm: Path):
+    w, h, rgb = read_ppm(str(ppm))
+    o = ((h // 2) * w + (w // 2)) * 3
+    return (rgb[o], rgb[o + 1], rgb[o + 2])
+
+
+def is_grey(px) -> bool:
+    r, g, b = px
+    return r < 150 and abs(r - g) < 40 and abs(g - b) < 40
+
+
+def is_green(px) -> bool:
+    r, g, b = px
+    return g >= 150 and r <= 90 and b <= 140
+
+
+def first_button(dev) -> str | None:
+    for inp in dev.inputs():
+        if inp.get("kind") == "button" and inp.get("id"):
+            return inp["id"]
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device",   required=True, help="a133 | a523 | ...")
+    ap.add_argument("--binary",   required=True, type=Path)
+    ap.add_argument("--sim",      required=True, type=Path)
+    ap.add_argument("--platform", required=True, type=Path)
+    ap.add_argument("--qemu-tsp", required=True, type=Path)
+    ap.add_argument("--rootfs",   required=True, type=Path)
+    ap.add_argument("--outdir",   required=True, type=Path)
+    args = ap.parse_args()
+
+    for label, path in (("binary", args.binary), ("sim", args.sim),
+                        ("platform", args.platform),
+                        ("qemu-tsp", args.qemu_tsp), ("rootfs", args.rootfs)):
+        if not path.exists():
+            raise SystemExit(f"[run-under-sim] --{label} does not exist: {path}")
+
+    Device, read_ppm = _import_sim(args.sim)
+    stage_descriptor(args.platform, args.device, args.outdir)
+
+    dev = Device(args.device, str(args.platform),
+                 launcher="qemu", outdir=str(args.outdir),
+                 app_arm64=str(args.binary),
+                 qemu_tsp=str(args.qemu_tsp), rootfs=str(args.rootfs))
+    dev.boot()
+    try:
+        # 1) rest frame — DRAWS. Centre pixel must be grey.
+        rest = args.outdir / "frames" / f"{dev.snapshot('rest')}.ppm"
+        rest_px = centre_pixel(read_ppm, rest)
+        if not is_grey(rest_px):
+            raise SystemExit(f"[run-under-sim] FAIL rest centre pixel not grey: {rest_px}")
+        print(f"[run-under-sim] {args.device}: rest OK  centre={rest_px}  ppm={rest}")
+
+        # 2) inject a button, re-snap — READS A BUTTON. Centre pixel must turn green.
+        btn = first_button(dev)
+        if not btn:
+            raise SystemExit(f"[run-under-sim] {args.device}: no button input in descriptor")
+        dev.press(btn)
+        pressed = args.outdir / "frames" / f"{dev.snapshot('pressed')}.ppm"
+        pressed_px = centre_pixel(read_ppm, pressed)
+        if not is_green(pressed_px):
+            raise SystemExit(f"[run-under-sim] FAIL pressed centre pixel not green "
+                             f"(button {btn!r}): {pressed_px}")
+        print(f"[run-under-sim] {args.device}: press '{btn}' OK  centre={pressed_px}  ppm={pressed}")
+
+        print(f"[run-under-sim] {args.device}: PASS (draws + reads a button, off-hardware)")
+        return 0
+    finally:
+        dev.shutdown()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

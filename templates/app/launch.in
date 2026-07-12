@@ -1,0 +1,15 @@
+#!/bin/sh
+# launch — the on-device launch shim (app.toml `[launch] exec = "./launch"`).
+#
+# This is where SDL3_DYNAMIC_API swaps the stock SDL3 the app was built against for the
+# PLATFORM's SDL3 (sunxifb on a133-powervr / kmsdrm on a523-mali) WITHOUT relinking — the
+# Steam-Link pattern. The binary links SDL3's public ABI; the DYNAPI jump table binds to
+# whatever libSDL3-pocketforge.so.0 the device ships. Do NOT bake a device SDL3 into the
+# app image.
+#
+# Under the E5 simulator this shim is NOT used — the sim runs the bare static binary
+# (stock software-render SDL3) for the off-hardware proof. This path is on-device only.
+set -eu
+here="$(cd "$(dirname "$0")" && pwd)"
+export SDL_DYNAMIC_API="${SDL_DYNAMIC_API:-/usr/lib/libSDL3-pocketforge.so.0}"
+exec "$here/{{APP_SLUG}}.arm64" "$@"

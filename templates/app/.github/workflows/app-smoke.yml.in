@@ -1,0 +1,82 @@
+name: app-smoke
+
+# {{APP_NAME}} headless CI smoke (scaffolded by pf-app).
+#
+# Two jobs, advisory-first (same posture as pocketforge-os/sim's sim-gate.yml — a red run
+# does not block merge until it's stable enough to promote to a required check):
+#
+#   build  — the HERMETIC aarch64 cross-build (./build.sh). Runs anywhere with docker;
+#            this is the portable, always-green gate. Asserts an arm64 ELF was produced.
+#   sim    — the OFF-HARDWARE proof (./ci/run-under-sim.py): boots the binary under
+#            qemu-tsp + the E5 sim, injects a button, asserts grey->green. Needs the lab
+#            prereqs (qemu-tsp, rootfs-arm64, /dev/uinput, the `input` group) so it runs
+#            on the self-hosted lab runner and skips cleanly elsewhere. Configure the
+#            baked paths via the env below.
+#
+# On-device run is a SEPARATE, owner-gated hardware phase — never in CI.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: [self-hosted, docker]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hermetic aarch64 cross-build
+        run: ./build.sh
+      - name: Assert arm64 ELF built
+        run: |
+          file build/{{APP_SLUG}}.arm64 | tee /tmp/{{APP_SLUG}}.file
+          grep -q 'ELF 64-bit LSB executable, ARM aarch64' /tmp/{{APP_SLUG}}.file
+
+  sim:
+    needs: build
+    runs-on: [self-hosted, lab]
+    timeout-minutes: 60
+    env:
+      # Baked sim prereqs on the lab host (override per runner as needed).
+      QEMU_TSP: /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64
+      ROOTFS:   /home/mm/sim-build/harness/rootfs-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if lab sim prereqs are absent
+        id: guard
+        run: |
+          if [ -x "$QEMU_TSP" ] && [ -d "$ROOTFS" ] && [ -e /dev/uinput ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "lab sim prereqs missing (QEMU_TSP/ROOTFS/uinput) — skipping sim job"
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build (populates .cache/{sim,platform} + the binary)
+        if: steps.guard.outputs.ok == '1'
+        run: ./build.sh
+      - name: Run under the E5 sim (draws + reads a button)
+        if: steps.guard.outputs.ok == '1'
+        run: |
+          sg input -c "./ci/run-under-sim.py \
+            --device {{DEVICE}} \
+            --binary   ./build/{{APP_SLUG}}.arm64 \
+            --sim      ./.cache/sim \
+            --platform ./.cache/platform \
+            --qemu-tsp $QEMU_TSP \
+            --rootfs   $ROOTFS \
+            --outdir   ./evidence/{{DEVICE}}"
+      - name: Upload evidence frames
+        if: steps.guard.outputs.ok == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: {{APP_SLUG}}-sim-evidence
+          path: evidence/{{DEVICE}}/frames/*.ppm
+          if-no-files-found: warn

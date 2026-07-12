@@ -1,0 +1,458 @@
+/*
+ * {{APP_NAME}} — a minimal PocketForge app: draws a rectangle, reads a button.
+ *
+ * This is the pf-app scaffold's starter skeleton. It is the SMALLEST honest app that
+ * exercises the whole PocketForge authoring loop, and it is derived from the shape of
+ * the reference app pocketforge-os/pf-hwprobe:
+ *
+ *   capabilities.toml (the device descriptor, platform-provided)
+ *     -> the E2 capability facade (libpocketforge C ABI: pf_connect / pf_acquire)
+ *     -> SDL3 (SDL3_DYNAMIC_API; on-device the env swap selects libSDL3-pocketforge.so.0)
+ *     -> a software-rendered off-screen framebuffer, dumped to PPM for the sim.
+ *
+ * What it does: renders ONE rectangle centred on a 1280x720 canvas. The rectangle is
+ * GREY at rest and turns GREEN while any button is held. Input arrives THROUGH the
+ * capability facade (pf_acquire("input")) — never by scanning /dev with ambient
+ * authority. It speaks the E5 simulator's `ready` / `snap <ppm>` / `quit` FIFO protocol,
+ * so `ci/run-under-sim.py` can drive it headless and prove the button read end-to-end
+ * off-hardware.
+ *
+ * WHERE TO GROW IT: add controls (read more evdev codes from layout.txt), draw real UI,
+ * acquire more capabilities (`use=[...]` in app.toml + pf_acquire / pf_rumble_pulse /
+ * pf_entropy_fill). The reference app pf-hwprobe shows the data-driven, per-control-class
+ * widget pattern (one module per control class; missing hardware = descriptor row
+ * omission, never a crash). See docs/BUILD-YOUR-OWN-APP.md.
+ *
+ * SDL3_DYNAMIC_API (the Steam-Link pattern): built against SDL3's PUBLIC headers and
+ * linked with a stock SDL3 for the off-hardware proof. The DYNAPI jump table lets the
+ * `launch` shim set `SDL_DYNAMIC_API=/usr/lib/libSDL3-pocketforge.so.0` and swap in the
+ * on-device sunxifb/kmsdrm SDL3 UNCHANGED. This app never links a vendored device SDL3.
+ *
+ * tsp-osr (the renderer footgun this app deliberately dodges): on the sunxifb backend a
+ * window created WITHOUT a valid EGL surface + SDL_CreateRenderer() NULL-derefs inside
+ * PowerVR's libIMGegl.so. The fix is owned-source (libsdl3-sunxifb "Fix A", merged) — so
+ * you just link the fixed lib. This app additionally follows the safe recipe: under the
+ * sim it renders with SDL_CreateSoftwareRenderer() on an off-screen surface (no window,
+ * no GL — inherently safe); the on-device window recipe is documented in
+ * pin_tsp_osr_recipe() below.
+ */
+
+#include <SDL3/SDL.h>
+#include <pocketforge.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+
+/* Generic evdev event-type numbers (kernel ABI, device-independent). A button press is
+ * an EV_KEY event with a non-zero value; we never name a per-device button code. */
+enum { EV_TYPE_SYN = 0, EV_TYPE_KEY = 1, EV_TYPE_ABS = 3 };
+
+/* 64-bit kernel input_event, packed <l l H H i> = 24 bytes. Header-free so this TU
+ * never drags in <linux/input-event-codes.h> and its per-device symbols. */
+struct evdev_event {
+    long           sec;
+    long           usec;
+    unsigned short type;
+    unsigned short code;
+    int            value;
+};
+
+/* One (ev_type, code) binding + its live value, parsed from layout.txt. */
+struct binding {
+    int type;
+    int code;
+    int value;
+};
+
+#define MAX_BINDINGS  8
+#define MAX_CONTROLS  40
+#define MAX_NODES     4
+#define PATH_BUF      512
+
+struct control {
+    int            n_bindings;
+    struct binding bindings[MAX_BINDINGS];
+};
+
+struct app {
+    int            canvas_w, canvas_h;
+
+    int            n_controls;
+    struct control controls[MAX_CONTROLS];
+
+    /* input: node PATHS come from layout.txt (platform-provided); fds open only AFTER
+     * pf_acquire("input") authorizes — the app never scans /dev. */
+    int            n_nodes;
+    char           node_path[MAX_NODES][PATH_BUF];
+    int            n_fds;
+    int            node_fd[MAX_NODES];
+    int            input_authorized;
+
+    PfSession     *session;   /* E2 facade handle; may be NULL in a descriptor-only run */
+};
+
+/* ------------------------------------------------------------------ evidence log */
+static void log_line(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+/* ------------------------------------------------------------------ layout.txt parse
+ *
+ * The sim (and, later, the platform) writes a descriptor-derived layout the app draws
+ * from — ONE source of truth. Grammar (whitespace-separated, one per line):
+ *   canvas <W> <H> <rotation>
+ *   node   <path>
+ *   ctl    <name> <kind> <x> <y> <w> <h> <n_bindings> [<evtype> <code> <min> <max> <role>]*
+ * This minimal app only needs the canvas size, the input node paths, and each control's
+ * (evtype,code) bindings — enough to know "is any button down". */
+static char *tok(char **cur) { return strtok_r(NULL, " \t\n", cur); }
+
+static int parse_layout(struct app *app, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        log_line("{{APP_SLUG}}: layout open %s failed: %s", path, strerror(errno));
+        return -1;
+    }
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *save = NULL;
+        char *head = strtok_r(line, " \t\n", &save);
+        if (!head || head[0] == '#') continue;
+
+        if (!strcmp(head, "canvas")) {
+            char *w = tok(&save), *h = tok(&save);
+            if (w) app->canvas_w = atoi(w);
+            if (h) app->canvas_h = atoi(h);
+        } else if (!strcmp(head, "node")) {
+            char *p = tok(&save);
+            if (!p || app->n_nodes >= MAX_NODES) continue;
+            snprintf(app->node_path[app->n_nodes++], PATH_BUF, "%s", p);
+        } else if (!strcmp(head, "ctl")) {
+            if (app->n_controls >= MAX_CONTROLS) continue;
+            struct control *c = &app->controls[app->n_controls];
+            memset(c, 0, sizeof *c);
+            /* name kind x y w h n_bindings */
+            (void)tok(&save); (void)tok(&save);              /* name, kind */
+            (void)tok(&save); (void)tok(&save);              /* x, y */
+            (void)tok(&save); (void)tok(&save);              /* w, h */
+            char *nc_s = tok(&save);
+            if (!nc_s) continue;
+            int nc = atoi(nc_s);
+            if (nc > MAX_BINDINGS) nc = MAX_BINDINGS;
+            for (int i = 0; i < nc; i++) {
+                char *t = tok(&save), *cd = tok(&save);
+                (void)tok(&save); (void)tok(&save); (void)tok(&save);  /* min, max, role */
+                if (!t || !cd) break;
+                struct binding *b = &c->bindings[c->n_bindings++];
+                b->type = atoi(t);
+                b->code = atoi(cd);
+                b->value = 0;
+            }
+            app->n_controls++;
+        }
+    }
+    fclose(f);
+    log_line("{{APP_SLUG}}: layout parsed: canvas %dx%d, %d controls, %d input nodes",
+             app->canvas_w, app->canvas_h, app->n_controls, app->n_nodes);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ input via the facade
+ *
+ * Two-step capability seam (the reason this app exists as a facade consumer):
+ *   (1) AUTHORIZATION — pf_acquire(session, "input") must return PF_OK. The decision
+ *       routes THROUGH the facade (the broker on-device; the in-process backend under
+ *       the sim). A denied result degrades gracefully — no ambient node access, no crash.
+ *   (2) THE EVENT FD — input_fd_for() is the SINGLE SWAPPABLE SEAM. Under the sim we open
+ *       the platform-PROVIDED node path from layout.txt (written by the sim; never
+ *       discovered by the app). On-device, swap the body to the frozen-v1-additive
+ *       facade export `int pf_acquire_input_fd(PfSession*)` — no other app change. */
+static int input_fd_for(struct app *app, const char *platform_node_path) {
+    /* ON-DEVICE: replace this body with `return pf_acquire_input_fd(app->session);`
+     * once you build against a runtime that exports it (it is frozen-v1 additive). */
+    (void)app;
+    return open(platform_node_path, O_RDONLY | O_NONBLOCK);
+}
+
+static void acquire_input(struct app *app) {
+    if (app->session) {
+        int st = pf_acquire(app->session, "input");
+        app->input_authorized = (st == PF_OK);
+        if (!app->input_authorized) {
+            log_line("{{APP_SLUG}}: pf_acquire(\"input\") -> %s (%d) — not authorized, no input",
+                     pf_strerror(st), st);
+            return;
+        }
+        log_line("{{APP_SLUG}}: input capability acquired via facade (pf_acquire -> PF_OK)");
+    } else {
+        app->input_authorized = 1;   /* descriptor-only run: no facade to authorize against */
+        log_line("{{APP_SLUG}}: no facade session; reading platform node paths (descriptor-only)");
+    }
+    for (int i = 0; i < app->n_nodes; i++) {
+        int fd = input_fd_for(app, app->node_path[i]);
+        if (fd < 0) {
+            log_line("{{APP_SLUG}}: input node open %s failed: %s",
+                     app->node_path[i], strerror(errno));
+            continue;
+        }
+        app->node_fd[app->n_fds++] = fd;
+        log_line("{{APP_SLUG}}: input fd %d from platform node %s", fd, app->node_path[i]);
+    }
+}
+
+static void apply_event(struct app *app, const struct evdev_event *e) {
+    if (e->type == EV_TYPE_SYN) return;
+    for (int i = 0; i < app->n_controls; i++) {
+        struct control *c = &app->controls[i];
+        for (int j = 0; j < c->n_bindings; j++) {
+            struct binding *b = &c->bindings[j];
+            if (b->type == e->type && b->code == e->code) b->value = e->value;
+        }
+    }
+}
+
+static void drain_input(struct app *app) {
+    struct evdev_event ev;
+    for (int n = 0; n < app->n_fds; n++) {
+        while (read(app->node_fd[n], &ev, sizeof ev) == (ssize_t)sizeof ev)
+            apply_event(app, &ev);
+    }
+}
+
+/* Any button (any EV_KEY binding) currently held? This is the whole "reads a button". */
+static int any_button_down(const struct app *app) {
+    for (int i = 0; i < app->n_controls; i++) {
+        const struct control *c = &app->controls[i];
+        for (int j = 0; j < c->n_bindings; j++)
+            if (c->bindings[j].type == EV_TYPE_KEY && c->bindings[j].value) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ software fb + SDL */
+static int make_framebuffer(size_t bytes, void **mem) {
+    int fd = -1;
+#ifdef SYS_memfd_create
+    fd = (int)syscall(SYS_memfd_create, "{{APP_SLUG}}-fb", 0u);
+#endif
+    if (fd >= 0 && ftruncate(fd, (off_t)bytes) != 0) { close(fd); fd = -1; }
+    if (fd >= 0) {
+        *mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (*mem == MAP_FAILED) { close(fd); fd = -1; }
+    }
+    if (fd < 0) { *mem = calloc(1, bytes); return -1; }
+    return fd;
+}
+
+static void fill_rect(SDL_Renderer *r, int x, int y, int w, int h, int cr, int cg, int cb) {
+    SDL_SetRenderDrawColor(r, (Uint8)cr, (Uint8)cg, (Uint8)cb, 255);
+    SDL_FRect fr = { (float)x, (float)y, (float)w, (float)h };
+    SDL_RenderFillRect(r, &fr);
+}
+
+/* The whole picture: a dark canvas + one centred rectangle, grey at rest, green while a
+ * button is held. `ci/run-under-sim.py` samples the canvas-centre pixel to prove the
+ * grey->green transition end-to-end. */
+static void render_frame(SDL_Renderer *r, const struct app *app) {
+    fill_rect(r, 0, 0, app->canvas_w, app->canvas_h, 24, 24, 24);
+    int w = 240, h = 140;
+    int x = app->canvas_w / 2 - w / 2, y = app->canvas_h / 2 - h / 2;
+    if (any_button_down(app)) fill_rect(r, x, y, w, h, 40, 200, 90);   /* GREEN: pressed */
+    else                      fill_rect(r, x, y, w, h, 70, 70, 70);    /* GREY:  at rest */
+    SDL_RenderPresent(r);
+}
+
+static void dump_ppm_from_argb(const void *argb, unsigned char *rgb, int w, int h,
+                               const char *path) {
+    const uint32_t *px = (const uint32_t *)argb;
+    for (int i = 0; i < w * h; i++) {
+        rgb[i * 3 + 0] = (unsigned char)((px[i] >> 16) & 0xff);
+        rgb[i * 3 + 1] = (unsigned char)((px[i] >>  8) & 0xff);
+        rgb[i * 3 + 2] = (unsigned char)((px[i]      ) & 0xff);
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { log_line("{{APP_SLUG}}: ppm open %s failed: %s", path, strerror(errno)); return; }
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    fwrite(rgb, 1, (size_t)w * h * 3, f);
+    fclose(f);
+}
+
+/* ------------------------------------------------------------------ pf runtime seam */
+static void connect_runtime(struct app *app, const char *io_dir) {
+    char desc[PATH_BUF];
+    snprintf(desc, sizeof desc, "%s/capabilities.toml", io_dir);
+    struct stat st;
+    if (stat(desc, &st) == 0) {
+        app->session = pf_connect_descriptor(desc);
+        if (app->session) {
+            log_line("{{APP_SLUG}}: pf_connect_descriptor(%s) ok, wire v%u",
+                     desc, pf_wire_version());
+            return;
+        }
+        log_line("{{APP_SLUG}}: pf_connect_descriptor(%s) failed, trying env", desc);
+    }
+    app->session = pf_connect();
+    log_line("{{APP_SLUG}}: pf_connect() -> %s", app->session ? "ok" : "NULL (descriptor-only)");
+}
+
+/* ------------------------------------------------------------------ FIFO line I/O */
+static int fifo_readline(int fd, char *buf, size_t cap) {
+    size_t n = 0;
+    while (n + 1 < cap) {
+        char ch;
+        ssize_t r = read(fd, &ch, 1);
+        if (r <= 0) return -1;
+        if (ch == '\n') break;
+        buf[n++] = ch;
+    }
+    buf[n] = '\0';
+    return (int)n;
+}
+
+static void fifo_reply(int fd, const char *s) {
+    (void)!write(fd, s, strlen(s));
+    (void)!write(fd, "\n", 1);
+}
+
+/* ------------------------------------------------------------------ tsp-osr recipe (PINNED)
+ *
+ * The safe on-device renderer-creation recipe every PocketForge app reuses. On the sunxifb
+ * backend the SDL software renderer is not compiled in — every SDL_Renderer IS the
+ * GLES2-over-PowerVR path — so you cannot sidestep GL on real hardware. The recipe:
+ *   A. OWNED-SOURCE FIX (already landed): libsdl3-sunxifb "Fix A" makes SUNXIFB_CreateWindow
+ *      always create the EGL surface. Just link the fixed libSDL3-pocketforge.so.0.
+ *   B. APP-SIDE BELT-AND-SUSPENDERS (on-device window): create the window WITH
+ *      SDL_WINDOW_OPENGL so SDL core loads EGL + the backend makes the surface even on an
+ *      unpatched lib, then SDL_CreateRenderer(window, NULL) binds GLES2 to that surface.
+ *   C. THE SIM PATH (this binary, off-hardware): no panel/GL — render with
+ *      SDL_CreateSoftwareRenderer() on an off-screen surface (NO window, NO GL), inherently
+ *      tsp-osr-safe. That is what main() uses for the CI/sim proof.
+ * This probe exercises recipe B off-hardware (software driver) as a smoke check. On-panel
+ * proof on real PowerVR/Mali silicon is a separate, owner-gated hardware phase. */
+static void pin_tsp_osr_recipe(int w, int h) {
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+    SDL_Window *win = SDL_CreateWindow("{{APP_SLUG}}-tsp-osr-recipe", w, h, 0);
+    if (!win) {
+        log_line("{{APP_SLUG}}: tsp-osr recipe probe skipped (SDL_CreateWindow: %s)", SDL_GetError());
+        return;
+    }
+    SDL_Renderer *r = SDL_CreateRenderer(win, NULL);   /* must not NULL-deref (tsp-osr) */
+    if (!r) {
+        log_line("{{APP_SLUG}}: tsp-osr recipe probe FAILED renderer NULL (%s)", SDL_GetError());
+        SDL_DestroyWindow(win);
+        return;
+    }
+    const char *name = SDL_GetRendererName(r);
+    log_line("{{APP_SLUG}}: tsp-osr recipe OK -> window + SDL_CreateRenderer -> '%s'",
+             name ? name : "?");
+    SDL_DestroyRenderer(r);
+    SDL_DestroyWindow(win);
+}
+
+/* ------------------------------------------------------------------ main */
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: {{APP_SLUG}} <io-dir>\n");
+        return 2;
+    }
+    const char *io_dir = argv[1];
+
+    struct app app;
+    memset(&app, 0, sizeof app);
+    app.canvas_w = 1280;
+    app.canvas_h = 720;
+
+    char layout_p[PATH_BUF], req_p[PATH_BUF], resp_p[PATH_BUF];
+    snprintf(layout_p, sizeof layout_p, "%s/layout.txt", io_dir);
+    snprintf(req_p,    sizeof req_p,    "%s/req",        io_dir);
+    snprintf(resp_p,   sizeof resp_p,   "%s/resp",       io_dir);
+
+    if (parse_layout(&app, layout_p) != 0) return 3;
+
+    /* SDL video: dummy driver — no window system needed under the sim. */
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
+    if (!SDL_Init(SDL_INIT_VIDEO))
+        log_line("{{APP_SLUG}}: SDL_Init(VIDEO) failed (%s) — surface path still works",
+                 SDL_GetError());
+    pin_tsp_osr_recipe(app.canvas_w, app.canvas_h);
+
+    /* Off-screen ARGB framebuffer + software renderer (tsp-osr-safe: no window/GL). */
+    size_t fb_bytes = (size_t)app.canvas_w * app.canvas_h * 4;
+    void  *fb_mem   = NULL;
+    int    fb_fd    = make_framebuffer(fb_bytes, &fb_mem);
+    log_line("{{APP_SLUG}}: fb %s %dx%d (%zu bytes)",
+             fb_fd >= 0 ? "memfd" : "anon", app.canvas_w, app.canvas_h, fb_bytes);
+
+    SDL_Surface *surf = SDL_CreateSurfaceFrom(app.canvas_w, app.canvas_h,
+                                              SDL_PIXELFORMAT_XRGB8888,
+                                              fb_mem, app.canvas_w * 4);
+    if (!surf) { log_line("{{APP_SLUG}}: SDL_CreateSurfaceFrom failed: %s", SDL_GetError()); return 3; }
+    SDL_Renderer *r = SDL_CreateSoftwareRenderer(surf);
+    if (!r) { log_line("{{APP_SLUG}}: SDL_CreateSoftwareRenderer failed: %s", SDL_GetError()); return 3; }
+
+    /* Descriptor-driven E2 seam, then acquire input THROUGH the facade. */
+    connect_runtime(&app, io_dir);
+    acquire_input(&app);
+
+    /* Optional capability, exercised gracefully: the app.toml declares `vibration?`
+     * (optional). pf_rumble_pulse never fails — it returns a tri-state, NOOP_ABSENT on a
+     * device with no rumble — so this is the honest "optional hardware" pattern with zero
+     * per-device code. Delete it if your app takes no vibration capability. */
+    if (app.session) {
+        int rst = pf_rumble_pulse(app.session, 40);
+        log_line("{{APP_SLUG}}: optional rumble pulse(40ms) -> %d (0=fired 1=absent 2=suppressed)", rst);
+    }
+
+    /* FIFO handshake — O_RDWR so open never blocks; the host owns the peer end. */
+    int req_fd = open(req_p, O_RDWR), resp_fd = open(resp_p, O_RDWR);
+    if (req_fd < 0 || resp_fd < 0) { log_line("{{APP_SLUG}}: FIFO open failed: %s", strerror(errno)); return 4; }
+
+    unsigned char *rgb = malloc((size_t)app.canvas_w * app.canvas_h * 3);
+    if (!rgb) { log_line("{{APP_SLUG}}: rgb scratch alloc failed"); return 5; }
+
+    fifo_reply(resp_fd, "ready");
+    log_line("{{APP_SLUG}}: ready — awaiting commands on %s", req_p);
+
+    char line[PATH_BUF];
+    while (fifo_readline(req_fd, line, sizeof line) >= 0) {
+        if (!strncmp(line, "snap", 4)) {
+            const char *path = line + 4;
+            while (*path == ' ') path++;
+            if (!*path) { fifo_reply(resp_fd, "err"); continue; }
+            drain_input(&app);
+            render_frame(r, &app);
+            dump_ppm_from_argb(fb_mem, rgb, app.canvas_w, app.canvas_h, path);
+            fifo_reply(resp_fd, "ok");
+        } else if (!strncmp(line, "quit", 4)) {
+            fifo_reply(resp_fd, "bye");
+            break;
+        } else if (line[0]) {
+            fifo_reply(resp_fd, "err");   /* unknown verb, per the sim FIFO contract */
+        }
+    }
+
+    free(rgb);
+    SDL_DestroyRenderer(r);
+    SDL_DestroySurface(surf);
+    if (fb_fd >= 0) { munmap(fb_mem, fb_bytes); close(fb_fd); } else { free(fb_mem); }
+    SDL_Quit();
+    if (app.session) pf_free(app.session);
+    for (int i = 0; i < app.n_fds; i++) close(app.node_fd[i]);
+    log_line("{{APP_SLUG}}: exit clean");
+    return 0;
+}
