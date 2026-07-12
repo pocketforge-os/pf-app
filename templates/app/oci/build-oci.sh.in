@@ -1,67 +1,155 @@
 #!/usr/bin/env bash
-# oci/build-oci.sh — the app-packaging harness STUB (scaffolded by pf-app).
+# oci/build-oci.sh — the app-packaging path (E8 / tsp-ziac.3), driveable by an app AUTHOR.
 #
-# STATUS: STUB. This is the authoring-side seam that the E8 packaging path
-# (tsp-ziac.3) fills in. It assembles the parts an author already owns — the built
-# binary, the launch shim, the validated app.toml — into a staging bundle, and marks
-# EXACTLY where each packaging + signing + SBOM + scan step plugs in. It intentionally
-# does NOT sign or push: those steps need the packaging path's keys + toolchain.
+# Takes the built app payload (build/{{APP_SLUG}}.arm64 + launch + app.toml) all the way to a
+# signed, scanned OCI bundle, entirely off-device:
 #
-# The target pipeline (tsp-ziac.3; build-integration-reference.md §18):
-#   mmdebstrap -> tar -> OCI image -> cosign sign-by-digest -> syft SBOM -> grype scan
-# and the SIBLING FILES that ride alongside app.toml in the installed bundle:
-#   app.toml            the descriptor (this app)
-#   app.toml.sig        minisign detached signature over app.toml         [.3]
-#   oci/                the OCI image layout (rootfs + config)             [.3]
-#   oci.sig             cosign signature over the OCI image BY DIGEST      [.3]
-#   sbom.spdx.json      syft SBOM of the bundle                           [.3]
-#   slice.conf          systemd resource limits for the app slice         [.3]
+#   mmdebstrap --format=tar  ->  umoci OCI image-layout  ->  cosign sign-by-DIGEST (oci.sig)
+#                                syft SBOM (sbom.spdx.json)
+#                                minisign (app.toml.sig)
+#                                grype vs a pinned DB (SEPARATE, non-blocking)
+#   ->  off-device VERIFY (the exact checks the on-device supervisor will run)
+#
+# apko is NOT used (it builds from APK/Alpine, cannot consume Debian repos) — mmdebstrap is
+# the path. The OCI is addressed BY DIGEST and written under dist/ (gitignored) — it is NEVER
+# committed to git; distribution/publish-by-digest is a separate concern (E8.4).
+#
+# Every tool runs at a PINNED version inside a hermetic toolchain container (oci/Dockerfile.pack
+# + oci/pins-pack.env) so packaging is reproducible off ANY docker host and never depends on
+# what is installed there. NEVER apt/pip into a running container — the recipe lives in the
+# Dockerfile.
+#
+# KEY BOUNDARY (honest, and load-bearing):
+#   --dev (default)  sign with a LOCALLY-GENERATED dev/test keypair (under dist/keys/) to PROVE
+#                    the mechanism end-to-end off-device. This is NOT release signing.
+#   --release-keys   sign with real keys you supply (--minisign-key / --cosign-key). The REAL
+#                    PocketForge release keys are trust-tier / CI-OIDC-only and are NOT readable
+#                    by an author or an agent — first-party release signing happens in the image
+#                    repo's sign-and-scan CI (see that workflow + platform PLATFORM-ABI-CONTRACT).
 #
 # Usage:
-#   ./oci/build-oci.sh [--out dist]
+#   ./oci/build-oci.sh                                  # build + dev-sign + scan + verify
+#   ./oci/build-oci.sh --out dist                       # choose output dir
+#   ./oci/build-oci.sh --release-keys \
+#        --minisign-key path/to/release.key \
+#        --cosign-key   path/to/cosign.key              # sign with supplied real keys
+#   ./oci/build-oci.sh --no-verify                      # skip the off-device verify step
+#
+# Requires: docker + network (first run pulls the pinned base + tool binaries and registers
+# qemu-arm64 binfmt). Run host: modelmaker (mm@10.0.40.90) or any docker host.
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"     # app project root
+OCI_DIR="$HERE/oci"
 cd "$HERE"
 
 OUT="dist"
+MODE="dev"
+MINISIGN_KEY=""; COSIGN_KEY=""; DO_VERIFY=1
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --out) OUT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        --dev) MODE="dev"; shift ;;
+        --release-keys) MODE="release"; shift ;;
+        --minisign-key) MINISIGN_KEY="$2"; shift 2 ;;
+        --cosign-key) COSIGN_KEY="$2"; shift 2 ;;
+        --no-verify) DO_VERIFY=0; shift ;;
+        -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
         *) echo "build-oci: unknown arg $1" >&2; exit 2 ;;
     esac
 done
 
 BIN="build/{{APP_SLUG}}.arm64"
-if [ ! -f "$BIN" ]; then
-    echo "build-oci: $BIN not found — run ./build.sh first" >&2
-    exit 1
+[ -f "$BIN" ] || { echo "build-oci: $BIN not found — run ./build.sh first" >&2; exit 1; }
+[ -f app.toml ] || { echo "build-oci: app.toml missing" >&2; exit 1; }
+
+# read identity from the descriptor (app.toml is the single source of truth)
+val() { grep -oP "^$1\\s*=\\s*\"\\K[^\"]+" app.toml | head -1; }
+APP_ID="$(val id)"; APP_VERSION="$(val version)"
+APP_SLUG="{{APP_SLUG}}"
+: "${APP_ID:?app.toml missing [app] id}"; : "${APP_VERSION:?app.toml missing [app] version}"
+# reproducible timestamp: the app's own last git commit, else a fixed epoch
+SDE="$(git -C "$HERE" log -1 --format=%ct 2>/dev/null || echo 1700000000)"
+
+# shellcheck disable=SC1091
+set -a; . "$OCI_DIR/pins-pack.env"; set +a
+PACK_IMAGE="pf-pack:${UMOCI_VER}-${COSIGN_VER}"
+
+banner() { printf '\n==== %s ====\n' "$*"; }
+DIST="$HERE/$OUT"; STAGE="$DIST/$APP_SLUG"
+PAYDIR="$DIST/.payload"; KEYDIR="$DIST/keys"
+
+# ---- 0. hermetic toolchain image (built once, cached) --------------------------
+if ! docker image inspect "$PACK_IMAGE" >/dev/null 2>&1; then
+    banner "build hermetic packaging toolchain ($PACK_IMAGE)"
+    docker build -f "$OCI_DIR/Dockerfile.pack" \
+        --build-arg MMDEBSTRAP_VER="$MMDEBSTRAP_VER" --build-arg MINISIGN_VER="$MINISIGN_VER" \
+        --build-arg UMOCI_VER="$UMOCI_VER" --build-arg UMOCI_SHA256="$UMOCI_SHA256" \
+        --build-arg COSIGN_VER="$COSIGN_VER" --build-arg COSIGN_SHA256="$COSIGN_SHA256" \
+        --build-arg SYFT_VER="$SYFT_VER" --build-arg SYFT_SHA256="$SYFT_SHA256" \
+        --build-arg GRYPE_VER="$GRYPE_VER" --build-arg GRYPE_SHA256="$GRYPE_SHA256" \
+        -t "$PACK_IMAGE" "$OCI_DIR"
 fi
 
-STAGE="$OUT/stage"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
+# qemu-arm64 binfmt (idempotent; needed so arm64 maintainer scripts run under mmdebstrap)
+banner "ensure qemu-arm64 binfmt (F-flag)"
+docker run --rm --privileged tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
 
-# ---- assemble the app payload the packaging path will wrap ---------------------
-cp "$BIN"      "$STAGE/{{APP_SLUG}}.arm64"
-cp launch      "$STAGE/launch"
-cp app.toml    "$STAGE/app.toml"
-chmod +x "$STAGE/launch" "$STAGE/{{APP_SLUG}}.arm64"
-echo "build-oci: staged app payload -> $STAGE"
+# ---- clean prior outputs (docker writes as root) + stage payload ---------------
+# create dist/ as the host user FIRST (else the cleanup `docker run -v` auto-creates it as
+# root and the subsequent host mkdir fails); then a root container clears any root-owned
+# leftovers from a prior run.
+mkdir -p "$DIST"
+docker run --rm -v "$DIST":/d alpine sh -c 'rm -rf /d/* /d/.payload 2>/dev/null || true' 2>/dev/null || true
+mkdir -p "$STAGE" "$PAYDIR" "$KEYDIR"
+cp "$BIN" "$PAYDIR/$APP_SLUG.arm64"; cp launch "$PAYDIR/launch"; cp app.toml "$PAYDIR/app.toml"
+chmod 0755 "$PAYDIR/launch" "$PAYDIR/$APP_SLUG.arm64"
+
+# ---- 1. pipeline: mmdebstrap -> tar -> umoci OCI-layout + syft SBOM -------------
+banner "package: mmdebstrap -> OCI image-layout (by digest) + SBOM"
+docker run --rm --privileged \
+    -v "$OCI_DIR":/pack:ro -v "$STAGE":/out -v "$PAYDIR":/payload:ro \
+    -e APP_ID="$APP_ID" -e APP_VERSION="$APP_VERSION" -e APP_SLUG="$APP_SLUG" \
+    -e TARGET_ARCH=arm64 -e SOURCE_DATE_EPOCH="$SDE" -e OUT=/out -e PAYLOAD=/payload \
+    "$PACK_IMAGE" bash /pack/lib/pipeline.sh
+
+# ---- 2. sign: minisign(app.toml) + cosign(oci, by digest) ----------------------
+if [ "$MODE" = dev ]; then
+    banner "sign with a DEV keypair (proves the mechanism; NOT release signing)"
+    docker run --rm -v "$KEYDIR":/keys -w /keys "$PACK_IMAGE" bash -euc '
+        [ -f dev-minisign.key ] || minisign -G -p dev-minisign.pub -s dev-minisign.key -W
+        [ -f cosign.key ] || COSIGN_PASSWORD="" cosign generate-key-pair >/dev/null'
+    MINISIGN_KEY=/keys/dev-minisign.key; COSIGN_KEY=/keys/cosign.key
+    KMOUNT=(-v "$KEYDIR":/keys)
+else
+    [ -n "$MINISIGN_KEY" ] && [ -n "$COSIGN_KEY" ] || { echo "build-oci: --release-keys needs --minisign-key and --cosign-key" >&2; exit 2; }
+    banner "sign with SUPPLIED release keys"
+    KMOUNT=(-v "$(cd "$(dirname "$MINISIGN_KEY")" && pwd)":/mk:ro -v "$(cd "$(dirname "$COSIGN_KEY")" && pwd)":/ck:ro)
+    MINISIGN_KEY=/mk/"$(basename "$MINISIGN_KEY")"; COSIGN_KEY=/ck/"$(basename "$COSIGN_KEY")"
+fi
+docker run --rm -v "$OCI_DIR":/pack:ro -v "$STAGE":/out "${KMOUNT[@]}" \
+    -e OUT=/out -e APP_TOML=/out/app.toml \
+    -e MINISIGN_KEY="$MINISIGN_KEY" -e COSIGN_KEY="$COSIGN_KEY" -e COSIGN_PASSWORD="${COSIGN_PASSWORD:-}" \
+    "$PACK_IMAGE" bash /pack/lib/sign.sh
+
+# ---- 3. scan: grype vs pinned DB (SEPARATE, non-blocking) ----------------------
+banner "scan: grype (advisory, never gates packaging)"
+docker run --rm -v "$OCI_DIR":/pack:ro -v "$STAGE":/out -e OUT=/out "$PACK_IMAGE" bash /pack/lib/scan.sh || true
+
+# ---- 4. off-device VERIFY (what the on-device supervisor will run) --------------
+if [ "$DO_VERIFY" = 1 ] && [ "$MODE" = dev ]; then
+    banner "verify OFF-DEVICE (dev keys) — proves the bundle is well-formed"
+    docker run --rm -v "$OCI_DIR":/pack:ro -v "$STAGE":/out -v "$KEYDIR":/keys \
+        -e OUT=/out -e MINISIGN_PUB=/keys/dev-minisign.pub -e COSIGN_PUB=/keys/cosign.pub \
+        "$PACK_IMAGE" bash /pack/lib/verify.sh
+fi
+
+# ---- ownership back to the invoking user; drop the transient payload -----------
+docker run --rm -v "$DIST":/d alpine sh -c "chown -R $(id -u):$(id -g) /d; rm -rf /d/.payload" 2>/dev/null || true
+
+banner "packaged bundle -> $STAGE"
 ls -l "$STAGE"
-
-cat <<'NOTE'
-
-build-oci: STUB complete — payload staged, NOT packaged/signed.
-The following steps are handed to the E8 packaging path (tsp-ziac.3):
-
-  [ ] validate   : pf app-validate app.toml            (platform static validator)
-  [ ] rootfs     : mmdebstrap --variant=apt ... -> tar (minimal app rootfs)
-  [ ] oci        : oci/ image layout (rootfs + config)
-  [ ] sign       : minisign app.toml -> app.toml.sig ; cosign sign OCI BY DIGEST -> oci.sig
-  [ ] sbom       : syft <bundle> -o spdx-json > sbom.spdx.json
-  [ ] scan       : grype sbom:sbom.spdx.json (fail on the policy threshold)
-  [ ] slice      : emit slice.conf (systemd resource limits)
-
-See oci/build-oci.sh header + platform/docs/PLATFORM-ABI-CONTRACT.md §6.
-NOTE
+echo
+echo "  image digest : $(cat "$STAGE/oci.digest" 2>/dev/null)"
+echo "  siblings     : app.toml + app.toml.sig (minisign) + oci/ + oci.sig (cosign-by-digest) + sbom.spdx.json + grype-report.json"
+echo "  NOTE         : the OCI is addressed by digest and lives under $OUT/ (gitignored) — never commit it."
+echo "  ON-DEVICE    : the fielded supervisor verify+exec (both sigs, WITHOUT a reflash) is a SEPARATE, owner-gated hardware phase."

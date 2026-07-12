@@ -1,0 +1,64 @@
+# Packaging `{{APP_NAME}}` — the OCI + signature path
+
+`./oci/build-oci.sh` takes your built app all the way to a **signed, scanned OCI bundle**,
+entirely off-device. It is the authoring-side half of the PocketForge app packaging path
+(E8); the on-device launch+verify is a separate, owner-gated hardware phase.
+
+```
+build/{{APP_SLUG}}.arm64 + launch + app.toml
+        │
+        ▼   ./oci/build-oci.sh
+  mmdebstrap --format=tar  ─►  umoci OCI image-layout  ─►  cosign sign-by-DIGEST  ─►  oci.sig
+                               syft SBOM  ─►  sbom.spdx.json    minisign  ─►  app.toml.sig
+                               grype vs pinned DB  ─►  grype-report.json   (SEPARATE, non-blocking)
+        │
+        ▼   off-device VERIFY (the exact checks the on-device supervisor will run)
+  dist/{{APP_SLUG}}/  ─  app.toml, app.toml.sig, oci/, oci.sig, sbom.spdx.json, grype-report.json, slice.conf
+```
+
+## Run it
+
+```sh
+./build.sh                 # produce build/{{APP_SLUG}}.arm64 first
+./oci/build-oci.sh         # dev-sign + scan + verify   (needs docker + network on first run)
+```
+
+First run builds a **hermetic pinned toolchain image** (`oci/Dockerfile.pack` + `oci/pins-pack.env`:
+mmdebstrap, umoci, cosign, syft, grype, minisign — each at a sha256-pinned version) and
+registers qemu-arm64 binfmt, so packaging is reproducible off any docker host and never
+depends on what happens to be installed. **Never apt/pip into a container** — the recipe is the
+Dockerfile; bump a tool by editing `oci/pins-pack.env` on its own PR.
+
+## The two-signature bundle
+
+| sibling | signer | over what |
+|---|---|---|
+| `app.toml.sig` | **minisign** (Ed25519) | `app.toml` — the descriptor |
+| `oci.sig` | **cosign** (sigstore bundle) | `oci/index.json` — the content-addressed **Merkle root** of the OCI image-layout |
+
+`oci.sig` signs the image **BY DIGEST**: `index.json` commits to the manifest by `sha256:…`,
+which commits to the config and every layer by digest, and every blob is stored under
+`oci/blobs/sha256/<its-digest>`. So a valid signature over `index.json` + content-addressed
+load is a signature over the **entire image** — tampering any blob changes a digest the
+signature commits to. `dist/{{APP_SLUG}}/oci.digest` records the signed image digest.
+
+The **OCI is addressed by digest and written under `dist/` (gitignored) — never commit it to
+git.** Publishing the bundle by digest to a distribution channel is a separate concern (E8.4).
+
+## Signing keys — dev vs release (the honest boundary)
+
+- `--dev` (default): signs with a **locally-generated dev/test keypair** (`dist/keys/`) to
+  PROVE the mechanism end-to-end off-device. **This is not release signing.**
+- `--release-keys --minisign-key … --cosign-key …`: signs with real keys you supply.
+
+The **real PocketForge release keys are trust-tier / CI-OIDC-only** and are not readable by
+an author (or an agent). First-party apps are release-signed by the image repo's
+`sign-and-scan` CI, which assumes the signing role via GitHub OIDC in a protected environment.
+Your dev-signed bundle proves the shape that CI's release-signed bundle will have.
+
+## Why grype is decoupled and non-blocking
+
+A CVE is a fresh fact about the world — a new one lands days after a byte-identical build.
+Gating packaging on it would couple artifact identity to a moving external feed. So grype runs
+against a **pinned DB snapshot**, writes `grype-report.json`, and **always succeeds**; acting on
+findings is a separate policy decision, never a packaging-time hard-fail.

@@ -29,7 +29,7 @@ A complete, self-contained app project (see [`templates/app/`](templates/app)):
 | `launch` | the on-device `SDL3_DYNAMIC_API` shim (swaps in `libSDL3-pocketforge.so.0`). |
 | `build.sh` · `Makefile` · `pins.env` | hermetic aarch64 cross-build from committed refs. |
 | `ci/run-under-sim.py` | the E5-simulator proof (grey → green on an injected button press). |
-| `oci/build-oci.sh` | app-packaging harness **stub** (handed to the E8 packaging path). |
+| `oci/` | the **app-packaging path** (E8): `build-oci.sh` + a hermetic pinned toolchain (`Dockerfile.pack` + `pins-pack.env`) + `lib/` (mmdebstrap → OCI-by-digest → cosign/minisign → syft/grype) + `slice.conf`. Drives `app.toml` → a signed, scanned OCI bundle off-device. |
 | `.github/workflows/app-smoke.yml` | advisory CI: build (portable) + sim (lab runner). |
 
 The skeleton deliberately **dodges the `tsp-osr` renderer footgun** — it software-renders
@@ -41,12 +41,13 @@ off-screen under the sim, and documents the safe on-device window recipe (the ow
 | child | scope | status |
 |---|---|---|
 | `.1` | capability-facade ABI + reconciled `app.toml` schema + named per-family Platform ABI | ✅ merged |
-| **`.2`** | **`pf-app new` scaffold + templates + this guide** | **this repo** |
-| `.3` | packaging: `mmdebstrap → tar → OCI → cosign-by-digest → syft → grype` (`pf-app build`/`sign`) | next |
+| `.2` | `pf-app new` scaffold + templates + this guide | ✅ merged |
+| **`.3`** | **packaging: `mmdebstrap → tar → OCI-by-digest → cosign → syft → grype` (`oci/build-oci.sh`)** | **this repo** |
 | `.4` | distribution + deliver-without-reflash + per-developer keys (`pf-app push`) | design |
 
-So `pf-app build` / `sign` / `push` are **not yet implemented** — `oci/build-oci.sh` is the
-authoring-side stub that marks where the packaging path plugs in.
+Packaging (`.3`) is **landed** as [`oci/build-oci.sh`](templates/app/oci/build-oci.sh.in): one
+author command takes the built app to a signed, scanned OCI bundle off-device (dev-key proof;
+real release signing is CI-side via OIDC). Distribution (`pf-app push`, `.4`) is next.
 
 ## The contracts it targets
 
