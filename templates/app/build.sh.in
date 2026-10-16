@@ -20,6 +20,11 @@
 # Usage:
 #   ./build.sh                 # build target: aarch64
 #   ./build.sh --force-refetch # blow away caches under .cache/
+#
+# Artifact binding: every derived output records the pin it was built from
+# (build/deps/.*-sha, build/.linked-pins); a pins.env bump invalidates the
+# affected libraries and forces the final relink, and the cached source
+# worktrees are reset+cleaned exactly to their pins before consumption.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
@@ -52,7 +57,13 @@ clone_pin() {  # $1=repo $2=commit $3=dest
         banner "clone $(basename "$dest") @ $commit"
         git clone --quiet "$repo" "$dest"
     fi
-    (cd "$dest" && git fetch --quiet --tags origin && git -c advice.detachedHead=false checkout --quiet "$commit")
+    # Bind the cached worktree EXACTLY to the pin: a plain checkout would keep
+    # tracked edits made at an earlier commit and untracked leftovers, which
+    # could enter the runtime library, the SDL build or the sim image.
+    (cd "$dest" && git fetch --quiet --tags origin \
+        && git reset --hard --quiet "$commit" \
+        && git clean --quiet -ffd \
+        && git -c advice.detachedHead=false checkout --quiet "$commit")
     (cd "$dest" && git rev-parse HEAD)
 }
 
@@ -61,9 +72,28 @@ clone_pin "$RUNTIME_REPO"  "$RUNTIME_COMMIT"  "$RUNTIME_SRC"  > "$BUILD_DIR/runt
 clone_pin "$SIM_REPO"      "$SIM_COMMIT"      "$SIM_SRC"      > "$BUILD_DIR/sim.sha"
 clone_pin "$PLATFORM_REPO" "$PLATFORM_COMMIT" "$PLATFORM_SRC" > "$BUILD_DIR/platform.sha"
 
+# Derived artifacts are KEYED to the pins they were built from: each records the
+# input commit in a stamp file next to it, and a pin bump invalidates the
+# artifact (and forces the final relink) instead of silently reusing the stale
+# output of an earlier pin. --force-refetch invalidates everything.
+RUNTIME_STAMP="$DEPS_DIR/.libpocketforge.runtime-sha"
+SIM_STAMP="$DEPS_DIR/.libSDL3.sim-sha"
+PINS_STAMP="$BUILD_DIR/.linked-pins"
+stamp_matches() {  # $1=stamp file $2=expected content
+    [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]
+}
+current_pins="$RUNTIME_COMMIT $SIM_COMMIT $PLATFORM_COMMIT"
+if [ "$force_refetch" = 1 ] || ! stamp_matches "$PINS_STAMP" "$current_pins"; then
+    # Any pin drift (or a cold tree) forces the final link: make may otherwise
+    # keep an existing build/{{APP_SLUG}}.arm64 when the reused-or-rebuilt
+    # library timestamps do not happen to be newer.
+    rm -f "$BUILD_DIR/{{APP_SLUG}}.arm64"
+fi
+
 # ------------------------------------------------------------------ 2. libpocketforge.a (cross-Rust)
 LIBPF_A="$DEPS_DIR/libpocketforge.a"
-if [ ! -f "$LIBPF_A" ] || [ "$force_refetch" = 1 ]; then
+if [ ! -f "$LIBPF_A" ] || [ "$force_refetch" = 1 ] \
+   || ! stamp_matches "$RUNTIME_STAMP" "$RUNTIME_COMMIT"; then
     banner "cross-build libpocketforge.a (aarch64-unknown-linux-gnu, staticlib)"
     # HOST_UID/HOST_GID + the final chown: the container runs as root (apt/rustup
     # need it), so anything it writes to /out lands root-owned on the HOST bind
@@ -92,6 +122,7 @@ EOF
             chown -R "$HOST_UID:$HOST_GID" /out
         '
     echo "libpocketforge.a: $(file "$LIBPF_A")"
+    echo "$RUNTIME_COMMIT" > "$RUNTIME_STAMP"
 fi
 mkdir -p "$DEPS_DIR/include"
 cp -f "$RUNTIME_SRC/include/pocketforge.h" "$DEPS_DIR/include/pocketforge.h"
@@ -99,8 +130,12 @@ cp -f "$RUNTIME_SRC/include/pocketforge.h" "$DEPS_DIR/include/pocketforge.h"
 # ------------------------------------------------------------------ 3. libSDL3.a (arm64 render static)
 SDL3_A="$DEPS_DIR/libSDL3.a"
 SDL3_INC="$DEPS_DIR/sdl3-include"
-if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
+if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ] \
+   || ! stamp_matches "$SIM_STAMP" "$SIM_COMMIT"; then
     banner "cross-build SDL3 arm64 static (sim's fb/render recipe)"
+    # Drop the previous header tree so no stale header from an earlier SIM pin
+    # survives the overwrite-copy below (find-delete pattern, house rule).
+    if [ -d "$SDL3_INC" ]; then find "$SDL3_INC" -mindepth 1 -delete; fi
     # Same ownership hand-back as the rust container above (bead tsp-u3e4).
     docker run --rm \
         -v "$SIM_SRC":/sim:ro \
@@ -122,6 +157,7 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
             chown -R "$HOST_UID:$HOST_GID" /out
         '
     echo "libSDL3.a: $(file "$SDL3_A")"
+    echo "$SIM_COMMIT" > "$SIM_STAMP"
 fi
 
 # ------------------------------------------------------------------ 4. {{APP_SLUG}}.arm64
@@ -163,6 +199,7 @@ else
         '
 fi
 file "$BUILD_DIR/{{APP_SLUG}}.arm64"
+echo "$current_pins" > "$PINS_STAMP"
 
 banner "build ok"
 printf '   binary: %s\n' "$BUILD_DIR/{{APP_SLUG}}.arm64"
