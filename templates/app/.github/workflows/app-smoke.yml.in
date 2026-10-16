@@ -8,10 +8,15 @@ name: app-smoke
 #   build  — the HERMETIC aarch64 cross-build (./build.sh). Runs anywhere with docker;
 #            this is the portable, always-green gate. Asserts an arm64 ELF was produced.
 #   sim    — the OFF-HARDWARE proof (./ci/run-under-sim.py): boots the binary under
-#            qemu-tsp + the E5 sim, injects a button, asserts grey->green. Needs the lab
-#            prereqs (qemu-tsp, rootfs-arm64, /dev/uinput, the `input` group) so it runs
-#            on the self-hosted lab runner and skips cleanly elsewhere. Configure the
-#            baked paths via the env below.
+#            qemu-tsp + the E5 sim, injects a button through the sim's per-run PRIVATE
+#            FIFO control surface (sim control/control_surface.py, FifoSynth), asserts
+#            grey->green. NO HOST INPUT ROUTE (incident tsp-ihne1.56.5): the job never
+#            opens /dev/uinput, binds /dev/input, widens the char-major-13 device cgroup,
+#            escalates to the host input group, or projects a display/seat variable — the
+#            sim container
+#            carries everything (qemu-tsp + rootfs + platform descriptors are baked into
+#            the image), so the job runs on the headless builder VM with no lab host,
+#            no host prereqs and no skip path. It always executes.
 #
 # On-device run is a SEPARATE, owner-gated hardware phase — never in CI.
 
@@ -42,41 +47,62 @@ jobs:
 
   sim:
     needs: build
-    runs-on: [self-hosted, lab]
+    # Headless builder VM (org runner label pf-builder-vm) — the same lane the sim repo's
+    # own headless-suite and pf-hwprobe's smoke gate run on. The `lab` label this job used
+    # to carry matches NO runner (and the old lab host had a live seat — incident
+    # tsp-ihne1.56.5); nothing here needs a host device node anymore.
+    runs-on: [self-hosted, pf-builder-vm]
     timeout-minutes: 60
     env:
-      # Baked sim prereqs on the lab host (override per runner as needed).
-      QEMU_TSP: /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64
-      ROOTFS:   /home/mm/sim-build/harness/rootfs-arm64
+      SIM_IMG: pocketforge-sim:{{APP_SLUG}}-smoke-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
-      - name: Skip if lab sim prereqs are absent
-        id: guard
-        run: |
-          if [ -x "$QEMU_TSP" ] && [ -d "$ROOTFS" ] && [ -e /dev/uinput ]; then
-            echo "ok=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "lab sim prereqs missing (QEMU_TSP/ROOTFS/uinput) — skipping sim job"
-            echo "ok=0" >> "$GITHUB_OUTPUT"
-          fi
       - name: Build (populates .cache/{sim,platform} + the binary)
-        if: steps.guard.outputs.ok == '1'
         run: ./build.sh
-      - name: Run under the E5 sim (draws + reads a button)
-        if: steps.guard.outputs.ok == '1'
+      - name: Resolve pinned sim commit from pins.env
+        id: sim
         run: |
-          sg input -c "./ci/run-under-sim.py \
-            --device {{DEVICE}} \
-            --binary   ./build/{{APP_SLUG}}.arm64 \
-            --sim      ./.cache/sim \
-            --platform ./.cache/platform \
-            --qemu-tsp $QEMU_TSP \
-            --rootfs   $ROOTFS \
-            --outdir   ./evidence/{{DEVICE}}"
+          # shellcheck disable=SC1091
+          . ./pins.env
+          echo "sim_commit=${SIM_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "resolved sim commit: ${SIM_COMMIT}"
+      - name: Build the sim's pocketforge-sim image (baked qemu-tsp + rootfs + platform)
+        run: |
+          docker build -t "$SIM_IMG" .cache/sim
+      - name: Run under the E5 sim (draws + reads a button via private FIFOs)
+        run: |
+          # The wrapper runs INSIDE the sim container: input rides the sim's per-run
+          # private FIFOs (control_surface.FifoSynth) created under the outdir — no host
+          # /dev/uinput, no /dev/input bind, no device-cgroup rule, no seat variable.
+          # SYS_ADMIN + unconfined apparmor/seccomp are for the nested bwrap sandbox
+          # (namespaces + mount/pivot_root) ONLY, mirroring sim's own headless-suite job.
+          mkdir -p "evidence/{{DEVICE}}"
+          docker run --rm --network none \
+            --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
+            -v "$PWD/build:/app-build:ro" \
+            -v "$PWD/ci:/app-ci:ro" \
+            -v "$PWD/evidence:/evidence" \
+            "$SIM_IMG" shell -lc 'python3 /app-ci/run-under-sim.py \
+              --device {{DEVICE}} \
+              --binary "/app-build/{{APP_SLUG}}.arm64" \
+              --sim /opt/sim \
+              --platform "$PLATFORM" \
+              --qemu-tsp "$QEMU_TSP" \
+              --rootfs "$ROOTFS" \
+              --outdir "/evidence/{{DEVICE}}"'
       - name: Upload evidence frames
-        if: steps.guard.outputs.ok == '1'
         uses: actions/upload-artifact@v4
         with:
           name: {{APP_SLUG}}-sim-evidence
           path: evidence/{{DEVICE}}/frames/*.ppm
           if-no-files-found: warn
+      - name: Cleanup CI image
+        if: always()
+        run: docker image rm -f "$SIM_IMG" || true
+      # Defense-in-depth vs root-owned leftovers (same sweep as pf-hwprobe's smoke gate):
+      # the sim container writes evidence frames as root; reclaim ownership so the next
+      # run's checkout never wedges. A sweep, not a gate.
+      - name: Reclaim workspace ownership (prevent runner-workdir wedge)
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true

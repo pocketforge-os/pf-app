@@ -12,8 +12,10 @@
 # on-device SDL3 (libSDL3-pocketforge.so.0, sunxifb/kmsdrm) is swapped in at LAUNCH via
 # SDL3_DYNAMIC_API (see the `launch` shim) — never linked here.
 #
-# Requires: docker + the standard aarch64-linux-gnu cross-gcc.
-# Run host: modelmaker (mm@10.0.40.90) or any docker host. ~5-10 min cold, ~30 s warm.
+# Requires: docker. The host aarch64-linux-gnu cross-gcc is used when present; when it is
+# not (e.g. the headless pf-builder-vm CI lane) step 4 falls back to a container, same as
+# pf-hwprobe's build.sh (bead tsp-u3e4). Run host: any docker host.
+# ~5-10 min cold, ~30 s warm.
 #
 # Usage:
 #   ./build.sh                 # build target: aarch64
@@ -63,10 +65,16 @@ clone_pin "$PLATFORM_REPO" "$PLATFORM_COMMIT" "$PLATFORM_SRC" > "$BUILD_DIR/plat
 LIBPF_A="$DEPS_DIR/libpocketforge.a"
 if [ ! -f "$LIBPF_A" ] || [ "$force_refetch" = 1 ]; then
     banner "cross-build libpocketforge.a (aarch64-unknown-linux-gnu, staticlib)"
+    # HOST_UID/HOST_GID + the final chown: the container runs as root (apt/rustup
+    # need it), so anything it writes to /out lands root-owned on the HOST bind
+    # mount — which wedged the build-lab runner workdir (actions/checkout EACCES
+    # rmdir on stale root-owned deps, bead tsp-u3e4). Hand ownership back before
+    # the container exits so ./build.sh never leaves files its caller can't delete.
     docker run --rm \
         -v "$RUNTIME_SRC":/src:ro \
         -v "$DEPS_DIR":/out \
         -e CARGO_HOME=/tmp/cargo \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         "$RUST_IMAGE" bash -euxc '
             mkdir -p /work && cp -a /src/. /work/
             cd /work
@@ -81,6 +89,7 @@ EOF
             cargo build --release -p libpocketforge --target aarch64-unknown-linux-gnu
             cp target/aarch64-unknown-linux-gnu/release/libpocketforge.a /out/libpocketforge.a
             aarch64-linux-gnu-nm --defined-only /out/libpocketforge.a | grep -E "\\bT pf_" | wc -l
+            chown -R "$HOST_UID:$HOST_GID" /out
         '
     echo "libpocketforge.a: $(file "$LIBPF_A")"
 fi
@@ -92,9 +101,11 @@ SDL3_A="$DEPS_DIR/libSDL3.a"
 SDL3_INC="$DEPS_DIR/sdl3-include"
 if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
     banner "cross-build SDL3 arm64 static (sim's fb/render recipe)"
+    # Same ownership hand-back as the rust container above (bead tsp-u3e4).
     docker run --rm \
         -v "$SIM_SRC":/sim:ro \
         -v "$DEPS_DIR":/out \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         -w /work \
         debian:bookworm bash -euxc '
             apt-get update -qq
@@ -108,20 +119,49 @@ if [ ! -f "$SDL3_A" ] || [ "$force_refetch" = 1 ]; then
             cp /work/sdl3-render/arm64/lib/libSDL3.a /out/libSDL3.a
             mkdir -p /out/sdl3-include
             cp -a /work/sdl3-render/arm64/include/. /out/sdl3-include/
+            chown -R "$HOST_UID:$HOST_GID" /out
         '
     echo "libSDL3.a: $(file "$SDL3_A")"
 fi
 
 # ------------------------------------------------------------------ 4. {{APP_SLUG}}.arm64
 banner "cross-compile {{APP_SLUG}} (aarch64-linux-gnu-gcc)"
-export CC=aarch64-linux-gnu-gcc
-export SDL3_INCLUDE="$SDL3_INC"
-export PF_INCLUDE="$DEPS_DIR/include"
-export SDL3_STATIC="$SDL3_A"
-export PF_STATIC="$LIBPF_A"
-export OUT_DIR="$BUILD_DIR"
-export BIN_NAME="{{APP_SLUG}}.arm64"
-make -f Makefile all
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    # Native fast path — the host has the cross-gcc (typical dev machine).
+    export CC=aarch64-linux-gnu-gcc
+    export SDL3_INCLUDE="$SDL3_INC"
+    export PF_INCLUDE="$DEPS_DIR/include"
+    export SDL3_STATIC="$SDL3_A"
+    export PF_STATIC="$LIBPF_A"
+    export OUT_DIR="$BUILD_DIR"
+    export BIN_NAME="{{APP_SLUG}}.arm64"
+    make -f Makefile all
+else
+    # Container fallback (ported from pf-hwprobe's build.sh, bead tsp-u3e4): the
+    # headless CI builder VMs carry no cross-gcc — `make` dies with
+    # `aarch64-linux-gnu-gcc: No such file or directory`. Same hermetic pattern as
+    # steps 2/3, same ownership hand-back so nothing root-owned lands in the workdir.
+    # The double mount keeps an overridden BUILD_DIR working: the container always
+    # sees the build tree at /work/build.
+    docker run --rm \
+        -v "$HERE":/work -w /work \
+        -v "$BUILD_DIR":/work/build \
+        -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        debian:bookworm bash -euxc '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+                make file gcc-aarch64-linux-gnu libc6-dev-arm64-cross >/dev/null
+            export CC=aarch64-linux-gnu-gcc
+            export SDL3_INCLUDE=/work/build/deps/sdl3-include
+            export PF_INCLUDE=/work/build/deps/include
+            export SDL3_STATIC=/work/build/deps/libSDL3.a
+            export PF_STATIC=/work/build/deps/libpocketforge.a
+            export OUT_DIR=/work/build
+            export BIN_NAME={{APP_SLUG}}.arm64
+            make -f Makefile all
+            chown -R "$HOST_UID:$HOST_GID" /work/build
+        '
+fi
 file "$BUILD_DIR/{{APP_SLUG}}.arm64"
 
 banner "build ok"
