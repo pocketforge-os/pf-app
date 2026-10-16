@@ -24,7 +24,8 @@
 # Artifact binding: every derived output records the pin it was built from
 # (build/deps/.*-sha, build/.linked-pins); a pins.env bump invalidates the
 # affected libraries and forces the final relink, and the cached source
-# worktrees are reset+cleaned exactly to their pins before consumption.
+# worktrees are reset+cleaned (ignored files included) exactly to their pins
+# before consumption.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
@@ -58,11 +59,12 @@ clone_pin() {  # $1=repo $2=commit $3=dest
         git clone --quiet "$repo" "$dest"
     fi
     # Bind the cached worktree EXACTLY to the pin: a plain checkout would keep
-    # tracked edits made at an earlier commit and untracked leftovers, which
-    # could enter the runtime library, the SDL build or the sim image.
+    # tracked edits made at an earlier commit, untracked leftovers or IGNORED
+    # leftovers (-ffd keeps ignored files; -ffdx does not), any of which could
+    # enter the runtime library, the SDL build or the sim image.
     (cd "$dest" && git fetch --quiet --tags origin \
         && git reset --hard --quiet "$commit" \
-        && git clean --quiet -ffd \
+        && git clean --quiet -ffdx \
         && git -c advice.detachedHead=false checkout --quiet "$commit")
     (cd "$dest" && git rev-parse HEAD)
 }

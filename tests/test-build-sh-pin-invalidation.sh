@@ -41,7 +41,14 @@ case "$sub" in
     [ -n "$last_nonflag" ] && echo "$last_nonflag" > .git/FAKE_HEAD
     ;;
   rev-parse) cat .git/FAKE_HEAD ;;
-  fetch|clean) : ;;
+  fetch) : ;;
+  clean)
+    xflag=0
+    for a in "$@"; do case "$a" in *x*) xflag=1 ;; esac; done
+    if [ "$xflag" = 1 ] && [ -f .git/IGNORED ]; then
+      while IFS= read -r p; do [ -n "$p" ] && rm -f "$p"; done < .git/IGNORED
+    fi
+    ;;
   *) echo "shim-git: unsupported: $sub $*" >&2; exit 1 ;;
 esac
 EOF
@@ -125,8 +132,23 @@ for f in build/deps/libpocketforge.a build/deps/libSDL3.a "$BIN" \
 done
 pf1=$(content build/deps/libpocketforge.a); sdl1=$(content build/deps/libSDL3.a); bin1=$(content "$BIN")
 
+# Plant an ignored leftover in every cached source worktree: `git clean -ffd`
+# deliberately KEEPS ignored files, so only -ffdx (or a fresh clone) removes
+# them; run 2 must rebind each worktree exactly to its pin.
+for wt in .cache/runtime .cache/sim .cache/platform; do
+  printf 'leftover\n' > "$wt/ignored-leftover"
+  printf 'ignored-leftover\n' >> "$wt/.git/IGNORED"
+done
+
 # ---------------------------------------------------------------- run 2: warm, pins unchanged (negative control)
 run_build
+for wt in .cache/runtime .cache/sim .cache/platform; do
+  if [ -e "$wt/ignored-leftover" ]; then
+    fail "run2 kept the planted ignored leftover in $wt (clean must use -ffdx)"
+  else
+    ok "run2 removed the planted ignored leftover in $wt"
+  fi
+done
 pf2=$(content build/deps/libpocketforge.a); sdl2=$(content build/deps/libSDL3.a); bin2=$(content "$BIN")
 [ "$pf2" = "$pf1" ] && ok "run2 reused libpocketforge.a (pin unchanged)" || fail "run2 rebuilt libpocketforge.a despite unchanged pin"
 [ "$sdl2" = "$sdl1" ] && ok "run2 reused libSDL3.a (pin unchanged)" || fail "run2 rebuilt libSDL3.a despite unchanged pin"
