@@ -93,8 +93,16 @@ BIND_FLAGS = {"-v", "--volume", "--mount"}
 # Docker short options accept ATTACHED values (`-v/dev:/dev` == `-v /dev:/dev`,
 # `-eDISPLAY` == `-e DISPLAY`). They must be split before the deny model runs.
 SHORT_VALUE_FLAGS = ("-v", "-e")
-WORKSPACE_PREFIXES = ("$PWD/", "${PWD}/")
-WORKSPACE_EXACT = ("$PWD", "${PWD}")
+WORKSPACE_PREFIXES = (
+    "$GITHUB_WORKSPACE/", "${GITHUB_WORKSPACE}/",
+    "$RUNNER_TEMP/", "${RUNNER_TEMP}/",
+    "${{ github.workspace }}/", "${{ runner.temp }}/",
+)
+WORKSPACE_EXACT = (
+    "$GITHUB_WORKSPACE", "${GITHUB_WORKSPACE}",
+    "$RUNNER_TEMP", "${RUNNER_TEMP}",
+    "${{ github.workspace }}", "${{ runner.temp }}",
+)
 ARRAY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\[[@*]\]\}")
 DYNAMIC = re.compile(r"[$`]")
 
@@ -161,53 +169,16 @@ SHORT_BOOL_FLAGS = frozenset(
 
 # Quoting prevents word splitting but NOT the single resulting word from being a
 # complete Docker option (`FLAGS=--privileged; docker run "$FLAGS" img` runs
-# privileged) or an option-shaped image. Every quoted expansion in the option
-# region (including the image-slot candidate) therefore fails closed, EXCEPT a
-# bare "$VAR"/"${VAR}" image operand whose name is allowlisted here AND whose
-# every assignment in the same file folds to a safe static image reference.
-PROVEN_IMAGE_VARS = {"SIM_IMG"}
-# Runner-evaluated GitHub contexts proven to render numeric/hex text only.
-SAFE_GH_EXPR = re.compile(
-    r"\$\{\{\s*github\.(?:run_id|run_number|run_attempt|sha)\s*\}\}")
-# pf-app scaffold tokens ({{APP_SLUG}} etc.) render to slug-safe literals.
-SCAFFOLD_TOKEN_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
-IMAGE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$")
-SHELL_ASSIGN_RE = re.compile(
-    r"""(?:^|[\s;|&({])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)="""
-    r"""(\"[^\"]*\"|'[^']*'|[^\s;|&]*)""")
-PROVEN_VAR_TOKEN = re.compile(r"^\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)(?:\})?$")
-
-
-def unquote(value):
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
-
-
-def safe_image_value(value):
-    """True when an assigned value can only render as a static image reference:
-    known-safe runner contexts and scaffold tokens fold to placeholders and the
-    result is a plain reference (no whitespace, no leading dash, no residual
-    expansion)."""
-    folded = SCAFFOLD_TOKEN_RE.sub("0", SAFE_GH_EXPR.sub("0", value))
-    return bool(IMAGE_REF_RE.match(folded))
-
-
-def proven_image_vars(text):
-    """Allowlisted image variables whose every assignment in this text folds to
-    a safe static image reference. No assignment, or any unsafe assignment (or
-    unsafe `${{ }}` context), leaves the variable UNPROVEN (fail closed)."""
-    assignments = {}
-    for _lineno, line in logical_lines(text):
-        for m in SHELL_ASSIGN_RE.finditer(line):
-            if m.group(1) in PROVEN_IMAGE_VARS:
-                assignments.setdefault(m.group(1), []).append(unquote(m.group(2)))
-        for name in PROVEN_IMAGE_VARS:
-            m = re.match(r"^\s*-?\s*" + name + r":\s*(.+?)\s*$", line)
-            if m:
-                assignments.setdefault(name, []).append(unquote(m.group(1)))
-    return {name for name, values in assignments.items()
-            if values and all(safe_image_value(v) for v in values)}
+# privileged) or an option-shaped image. No scan of the workflow TEXT can prove a
+# variable's runtime value: channels outside the NAME=value grammar (printf -v,
+# read, eval/indirect, a sourced script, a $GITHUB_ENV write) mutate it after any
+# regex-visible assignment. Every dynamic (quoted or unquoted) expansion in the
+# option region therefore fails closed. The ONLY accepted dynamic image operand is
+# a word right after pflag's `--` end-of-options delimiter: docker parses the word
+# after `--` unconditionally as the image reference, so an option-shaped runtime
+# value fails as an invalid image instead of becoming a Docker option.
+DYNAMIC_IMAGE_HINT = ("a dynamic image operand is only allowed right after the "
+                      "`--` end-of-options delimiter")
 
 
 def logical_lines(text):
@@ -319,6 +290,12 @@ def docker_regions(tokens):
     n = len(tokens)
     while i < n:
         tok = tokens[i]
+        if tok == "--":
+            # pflag end-of-options delimiter: the next word is unconditionally
+            # the image operand.
+            if i + 1 < n:
+                return tokens[:i], i + 1, tokens[i + 2:]
+            return tokens, None, []
         if tok.startswith("-"):
             if tok in DOCKER_BOOL_FLAGS or "=" in tok or attached_short_pair(tok):
                 i += 1  # self-contained (boolean, inline `=`, or attached value)
@@ -419,7 +396,6 @@ def token_findings(tok, lineno):
 def scan_text(text):
     """Return findings: list of (rule, lineno, detail)."""
     findings = []
-    proven_vars = proven_image_vars(text)
     for lineno, line in logical_lines(text):
         for rule, pat in TEXT_RULES:
             m = pat.search(line)
@@ -519,7 +495,27 @@ def scan_text(text):
                 # OPTION region. An unquoted expansion here ($FLAGS, ${FLAGS},
                 # $(cmd), `cmd`) word-splits at runtime and can inject ANY option
                 # (--privileged, --device, binds, env) past this static scan.
-                if raws[i] == "unquoted":
+                if tok == "--":
+                    # pflag's end-of-options delimiter: the NEXT word is parsed
+                    # unconditionally as the image operand, so a dynamic image
+                    # reference can no longer be interpreted as a Docker option.
+                    if i + 1 >= n:
+                        findings.append(("unparseable_command", lineno,
+                                         "truncated `--` delimiter: no image operand "
+                                         "follows"))
+                    else:
+                        nxt = tokens[i + 1]
+                        findings.extend(token_findings(nxt, lineno))
+                        if nxt.startswith("-"):
+                            findings.append(("dynamic_route", lineno,
+                                             "option-shaped word follows the `--` "
+                                             "delimiter (misplaced delimiter or an "
+                                             f"option smuggled into the image slot): "
+                                             f"{nxt}"))
+                        else:
+                            image_seen = True  # the delimiter proves the boundary
+                        i += 1
+                elif raws[i] == "unquoted":
                     findings.append(("dynamic_route", lineno,
                                      "unquoted shell expansion in the docker option "
                                      "region can inject arbitrary options at runtime: "
@@ -542,20 +538,17 @@ def scan_text(text):
                                              f"unknown docker flag {tok} cannot be "
                                              f"proven safe: {tokens[i + 1]}"))
                         i += 1
-                elif raws[i] == "quoted":
+                elif raws[i] != "static":
                     # Quoting prevents word splitting but NOT the single word from
                     # evaluating to a complete option (--privileged) or an
-                    # option-shaped image. Only the explicit proven-image-variable
-                    # allowlist passes; everything else fails closed.
-                    m = PROVEN_VAR_TOKEN.match(tok)
-                    if m and m.group(1) in proven_vars:
-                        image_seen = True  # allowlisted, statically assigned image
-                    else:
-                        findings.append(("dynamic_route", lineno,
-                                         "quoted shell expansion in the docker option "
-                                         "region can evaluate to a complete docker "
-                                         "option at runtime (not a proven image "
-                                         f"variable): {tok}"))
+                    # option-shaped image, and no text scan can prove a variable's
+                    # runtime value. Fail closed; the `--` delimiter is the only
+                    # accepted route for a dynamic image operand.
+                    findings.append(("dynamic_route", lineno,
+                                     "quoted shell expansion in the docker option "
+                                     "region can evaluate to a complete docker "
+                                     f"option at runtime; {DYNAMIC_IMAGE_HINT}: "
+                                     f"{tok}"))
                 else:
                     image_seen = True  # first static positional operand = the image
             i += 1
@@ -589,7 +582,6 @@ def pair_ok(tokens, flag, value):
 CHECK_SUITE_TOKEN = re.compile(r"check-(?:\$suite|\$?\{?suite\}?|control|sensor|skin)")
 
 
-# ---------------------------------------------------------------- DeviceAllow
 # systemd unit files DO support backslash continuation and whitespace around `=`,
 # so DeviceAllow lines are matched after continuation-joining with a tolerant head.
 DEVICE_ALLOW = re.compile(r"\s*DeviceAllow\s*=\s*(.*)$")
@@ -683,6 +675,43 @@ def yaml_checks(path):
 
 # ---------------------------------------------------------------- self-test fixtures
 SELF_TEST_FIXTURES = [
+    ("red_image_var_printf_v_mutation",
+     'run: |\n  SIM_IMG=pocketforge-sim:smoke-a133-smoke-0\n'
+     "  printf -v SIM_IMG %s '--privileged'\n"
+     '  docker run --rm "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_image_var_read_mutation",
+     'run: |\n  SIM_IMG=pocketforge-sim:smoke-a133-smoke-0\n'
+     "  read -r SIM_IMG <<< '--device=/dev/uinput'\n"
+     '  docker run --rm "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_image_var_eval_mutation",
+     'run: |\n  SIM_IMG=pocketforge-sim:smoke-a133-smoke-0\n'
+     '  name=SIM_IMG; eval "$name=--privileged"\n'
+     '  docker run --rm "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_image_var_sourced_mutation",
+     'run: |\n  SIM_IMG=pocketforge-sim:smoke-a133-smoke-0\n'
+     '  . ./mutate-image-var.sh\n'
+     '  docker run --rm "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_image_var_github_env_write",
+     'env:\n  SIM_IMG: pocketforge-sim:hwprobe-smoke-${{ github.run_id }}\n'
+     'run: |\n  echo \'SIM_IMG=--privileged\' >> "$GITHUB_ENV"\n'
+     '  docker run --rm "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_option_after_delimiter",
+     'run: docker run --rm -- --oops pocketforge-sim:x shell\n',
+     {"dynamic_route"}),
+    ("red_delimiter_without_image",
+     'run: docker run --rm --\n',
+     {"unparseable_command"}),
+    ("red_pwd_bind_not_workspace_anchored",
+     'run: docker run --rm -v "$PWD/build:/app-build:ro" -- "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
+    ("red_home_bind_not_workspace_anchored",
+     'run: docker run --rm -v "$HOME/cache:/cache" -- "$SIM_IMG" shell\n',
+     {"dynamic_route"}),
     # (name, text, expect_rules) - argv/text scanner. expect_rules is the SET of
     # rules that must fire (empty set = must scan clean). Hardened fixtures are
     # converged verbatim with the platform guard (pocketforge-os/platform#354).
@@ -859,32 +888,32 @@ SELF_TEST_FIXTURES = [
      'run: docker run --rm "$SIM_IMG" cmd\n',
      {"dynamic_route"}),
     # ---- greens
-    ("green_proven_image_variable",
+    ("green_quoted_image_after_delimiter",
      'env:\n  SIM_IMG: pocketforge-sim:{{APP_SLUG}}-smoke-${{ github.run_id }}\n'
-     'run: docker run --rm --network none "$SIM_IMG" shell -lc "python3 /app-ci/run-under-sim.py"\n',
+     'run: docker run --rm --network none -- "$SIM_IMG" shell shell -lc "python3 /app-ci/run-under-sim.py"\n',
      set()),
     ("green_migrated_argv",
      "run: |\n"
      "  SIM_IMG=pocketforge-sim:smoke-a133-smoke-0\n"
      "  docker run --rm --network none \\\n"
      "    --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
-     '    "$SIM_IMG" "check-control" $BLOCKING\n',
+     '    -- "$SIM_IMG" "check-control" $BLOCKING\n',
      set()),
     ("green_doc_only_prose",
      "# input rides the sim's private per-run FIFOs; the host kernel node is never opened,\n"
      "# bound, or module-loaded, and no seat variable is projected (incident tsp-ihne1.56.5).\n",
      set()),
     ("green_workspace_chown_reclaim",
-     'run: docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
+     'run: docker run --rm -v "$GITHUB_WORKSPACE:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
      set()),
      ("green_workspace_child_binds",
       'run: |\n  SIM_IMG=pocketforge-sim:smoke-a133-smoke-0\n'
-      '  docker run --rm --network none -v "$PWD/build:/app-build:ro" '
-      '-v "$PWD/evidence:/evidence" "$SIM_IMG" shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
+      '  docker run --rm --network none -v "$GITHUB_WORKSPACE/build:/app-build:ro" '
+      '-v "$GITHUB_WORKSPACE/evidence:/evidence" -- "$SIM_IMG" shell shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
       set()),
      ("green_attached_workspace_bind",
       'run: |\n  SIM_IMG: pocketforge-sim:smoke-a133-smoke-1\n'
-      '  docker run --rm "-v$PWD/build:/app-build:ro" "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
+      '  docker run --rm "-v$GITHUB_WORKSPACE/build:/app-build:ro" -- "$SIM_IMG" shell shell -lc "python3 /app-ci/run.py"\n',
       set()),
     ("green_static_benign_bind",
      "run: docker run --rm -v /opt/pf/platform:/platform:ro img cmd\n",
@@ -899,10 +928,10 @@ SELF_TEST_FIXTURES = [
      '  mkdir -p "evidence/a133"\n'
      "  docker run --rm --network none \\\n"
      "    --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
-     '    -v "$PWD/build:/app-build:ro" \\\n'
-     '    -v "$PWD/ci:/app-ci:ro" \\\n'
-     '    -v "$PWD/evidence:/evidence" \\\n'
-     "    \"$SIM_IMG\" shell -lc 'python3 /app-ci/run-under-sim.py \\\n"
+     '    -v "$GITHUB_WORKSPACE/build:/app-build:ro" \\\n'
+     '    -v "$GITHUB_WORKSPACE/ci:/app-ci:ro" \\\n'
+     '    -v "$GITHUB_WORKSPACE/evidence:/evidence" \\\n'
+     "    -- \"$SIM_IMG\" shell -lc 'python3 /app-ci/run-under-sim.py \\\n"
      "      --device a133 \\\n"
      "      --binary \"/app-build/smoke-a133.arm64\" \\\n"
      "      --sim /opt/sim \\\n"
@@ -926,8 +955,8 @@ WRAPPER_CONTROL_GREEN = (
     "      - run: |\n"
     "          docker run --rm --network none \\\n"
     "            --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
-    '            -v "$PWD/build:/app-build:ro" -v "$PWD/ci:/app-ci:ro" -v "$PWD/evidence:/evidence" \\\n'
-    "            \"$SIM_IMG\" shell -lc 'python3 /app-ci/run-under-sim.py --device a133 \\\n"
+    '            -v "$GITHUB_WORKSPACE/build:/app-build:ro" -v "$GITHUB_WORKSPACE/ci:/app-ci:ro" -v "$GITHUB_WORKSPACE/evidence:/evidence" \\\n'
+    "            -- \"$SIM_IMG\" shell -lc 'python3 /app-ci/run-under-sim.py --device a133 \\\n"
     '              --binary /app-build/smoke-a133.arm64 --sim /opt/sim --platform "$PLATFORM" \\\n'
     "              --qemu-tsp \"$QEMU_TSP\" --rootfs \"$ROOTFS\" --outdir /evidence/a133'\n"
     "      - uses: actions/upload-artifact@v4\n"

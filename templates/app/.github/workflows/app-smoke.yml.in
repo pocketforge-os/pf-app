@@ -76,13 +76,17 @@ jobs:
           # /dev/uinput, no /dev/input bind, no device-cgroup rule, no seat variable.
           # SYS_ADMIN + unconfined apparmor/seccomp are for the nested bwrap sandbox
           # (namespaces + mount/pivot_root) ONLY, mirroring sim's own headless-suite job.
+          # Bind sources stay anchored at $GITHUB_WORKSPACE (the amended policy's allowed
+          # dynamic-bind anchor), and `--` before the image ends Docker's option parsing so
+          # the dynamic image operand can never be re-read as an option at runtime
+          # (guard delimiter rule, tsp-ihne1.56.5).
           mkdir -p "evidence/{{DEVICE}}"
           docker run --rm --network none \
             --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \
-            -v "$PWD/build:/app-build:ro" \
-            -v "$PWD/ci:/app-ci:ro" \
-            -v "$PWD/evidence:/evidence" \
-            "$SIM_IMG" shell -lc 'python3 /app-ci/run-under-sim.py \
+            -v "$GITHUB_WORKSPACE/build:/app-build:ro" \
+            -v "$GITHUB_WORKSPACE/ci:/app-ci:ro" \
+            -v "$GITHUB_WORKSPACE/evidence:/evidence" \
+            -- "$SIM_IMG" shell -lc 'python3 /app-ci/run-under-sim.py \
               --device {{DEVICE}} \
               --binary "/app-build/{{APP_SLUG}}.arm64" \
               --sim /opt/sim \
@@ -105,4 +109,4 @@ jobs:
       - name: Reclaim workspace ownership (prevent runner-workdir wedge)
         if: always()
         run: |
-          docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true
+          docker run --rm -v "$GITHUB_WORKSPACE:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true
