@@ -7,7 +7,9 @@ does end-to-end WITHOUT any hardware:
 
   1. DRAWS   — boots, binds the capability facade, renders a frame -> the canvas-centre
                pixel is GREY at rest.
-  2. READS A BUTTON — injects a real uinput button press through the sim control surface;
+  2. READS A BUTTON — injects a button press through the sim control surface (per-run
+               PRIVATE FIFOs created under the outdir — sim control/control_surface.py,
+               FifoSynth; NO host kernel input node is opened, incident tsp-ihne1.56.5);
                the app drains the event through the facade-authorized fd and re-renders
                -> the canvas-centre pixel turns GREEN.
 
@@ -16,21 +18,23 @@ a133/a523 delta is DATA (the descriptor), not code — same binary for both fami
 
 This wrapper only CONSUMES sim.control.control_surface.Device (read-only) and stages ONE
 input under --outdir (the copy of platform/devices/<id>/capabilities.toml the app reads
-via pf_connect_descriptor). Intended run host: modelmaker (mm@10.0.40.90).
+via pf_connect_descriptor). Intended run location: INSIDE the pocketforge-sim container
+(the app-smoke `sim` job invokes it through the image's `shell` verb, where qemu-tsp,
+the rootfs and the platform descriptors are baked-in image ENV paths).
 
-USAGE
------
-    ./ci/run-under-sim.py \\
+USAGE (inside the sim container)
+--------------------------------
+    python3 /app-ci/run-under-sim.py \\
         --device {{DEVICE}} \\
-        --binary   ./build/{{APP_SLUG}}.arm64 \\
-        --sim      ./.cache/sim \\
-        --platform ./.cache/platform \\
-        --qemu-tsp /home/mm/qemu-tsp/build/qemu-tsp/qemu-aarch64 \\
-        --rootfs   /home/mm/sim-build/harness/rootfs-arm64 \\
-        --outdir   ./evidence/{{DEVICE}}
+        --binary   /app-build/{{APP_SLUG}}.arm64 \\
+        --sim      /opt/sim \\
+        --platform "$PLATFORM" \\
+        --qemu-tsp "$QEMU_TSP" \\
+        --rootfs   "$ROOTFS" \\
+        --outdir   /evidence/{{DEVICE}}
 
-Needs the uinput node (root-only): run under `sg input -c '...'` on a host whose user is
-in the `input` group, or under sudo. Exits non-zero with a printed diagnostic on any
+Needs NO host device node, group or seat: the sim's control surface creates its input
+FIFOs privately under --outdir. Exits non-zero with a printed diagnostic on any
 handshake / capture / colour-assertion failure.
 """
 from __future__ import annotations
