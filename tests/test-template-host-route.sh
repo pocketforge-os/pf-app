@@ -66,7 +66,12 @@ app = sys.argv[2]
 mode = sys.argv[3] if len(sys.argv) > 3 else ""
 
 # ---------------------------------------------------------------- rule patterns
-# Applied to the shlex tokens of a joined `docker run` logical line.
+# Hardened deny-model core, converged with the platform guard
+# (pocketforge-os/platform#354 review rounds 1-3): literal token rules, a
+# sensitive-option value deny model (cgroup rules, bind sources, env), fail-closed
+# dynamic_route on shell indirection and whole-argv expansions in the Docker option
+# region, attached-value short options (-v/dev:/dev, -eDISPLAY) and region-aware
+# option/image/application splitting.
 TOKEN_RULES = [
     ("host_uinput_device", re.compile(r"/dev/uinput")),
     ("host_input_bind", re.compile(r"/dev/input(?![A-Za-z0-9_.-])")),
@@ -76,27 +81,83 @@ TOKEN_RULES = [
     ("host_display_projection", re.compile(r"/run/user/\d+/wayland")),
     ("host_display_projection", re.compile(r"(?:^|[,\s=])(?:DISPLAY|WAYLAND_DISPLAY|XAUTHORITY)(?:=|$)")),
 ]
-PAIR_FLAGS = {
-    "--device", "--device-cgroup-rule", "-v", "--volume", "--mount",
-    "-e", "--env",
-}
-CGROUP_MAJOR13 = re.compile(r"^c\s+13\s*:")
 
+# Sensitive docker options: their VALUE decides whether a host device, path or seat
+# variable reaches the container. A dynamic (shell-expanded) value cannot be proven
+# safe statically -> dynamic_route, fail closed (design-plan §3 pattern family).
+SENSITIVE_VALUE_FLAGS = {
+    "--device", "--device-cgroup-rule", "--cap-add",
+    "-v", "--volume", "--mount", "-e", "--env",
+}
+BIND_FLAGS = {"-v", "--volume", "--mount"}
+# Docker short options accept ATTACHED values (`-v/dev:/dev` == `-v /dev:/dev`,
+# `-eDISPLAY` == `-e DISPLAY`). They must be split before the deny model runs.
+SHORT_VALUE_FLAGS = ("-v", "-e")
+WORKSPACE_PREFIXES = ("$PWD/", "${PWD}/")
+WORKSPACE_EXACT = ("$PWD", "${PWD}")
+ARRAY_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\[[@*]\]\}")
+DYNAMIC = re.compile(r"[$`]")
+
+# Static bind sources that are (or contain, or sit above) host device/seat paths.
+PROTECTED_BIND_SOURCES = {
+    "/", "/dev", "/dev/input", "/dev/uinput", "/etc", "/home", "/root",
+    "/run", "/run/user", "/tmp", "/tmp/.X11-unix",
+}
+RUN_USER_RE = re.compile(r"^/run/user(?:/\d+)?(?:/.*)?$")
+
+CGROUP_RULE = re.compile(r"^([abc]) (\*|\d+):(\*|\d+)(?: [a-z]+)?$")
+
+# Text-level rules applied to every joined logical line (docker or not).
 TEXT_RULES = [
     ("host_uinput_permission", re.compile(r"\bmodprobe\s+(?:-\S+\s+)*uinput\b")),
     ("host_uinput_permission", re.compile(r"\bsg\s+input\b")),
     ("host_uinput_permission", re.compile(r"\b(?:chmod|chgrp|chown|setfacl|install)\b[^|;&\n]*/dev/(?:uinput|input)")),
     ("host_uinput_permission", re.compile(r"modules-load\.d/uinput")),
     ("host_input_tool", re.compile(r"\b(?:xdotool|xclip|xsel|wl-copy|wl-paste|xhost)\b")),
+    # Fail closed on dynamic module/group arguments: `mod=uinput; modprobe "$mod"`.
+    ("dynamic_route", re.compile(r"\bmodprobe\b[^|;&\n]*[$`]")),
+    ("dynamic_route", re.compile(r"\bsg\s+[^|;&\n]*[$`]")),
 ]
+
+# Assignments whose VALUE names a protected path/tool: the literal-scan evasion
+# `node=/dev/uinput; docker run --device "$node"` plants the literal HERE.
+ASSIGN_RULE = re.compile(
+    r"""(?:^|[\s;|&({])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=["']?"""
+    r"(/dev/uinput\b|/dev/input\b|/tmp/\.X11-unix\b|/run/user/\d+/(?:wayland|bus)\S*"
+    r"|xdotool\b|xclip\b|xsel\b|wl-copy\b|wl-paste\b|xhost\b|uinput\b)"
+)
+ASSIGN_VALUE_RULE = [
+    (re.compile(r"^/dev/uinput\b"), "host_uinput_device"),
+    (re.compile(r"^/dev/input\b"), "host_input_bind"),
+    (re.compile(r"^/tmp/\.X11-unix\b|^/run/user/"), "host_display_projection"),
+    (re.compile(r"^(?:xdotool|xclip|xsel|wl-copy|wl-paste|xhost)\b"), "host_input_tool"),
+    (re.compile(r"^uinput\b"), "host_uinput_permission"),
+]
+
+# Permission commands with dynamic arguments hide the target: `n=/dev/uinput; chmod "$n"`.
+# The ownership-reclaim idiom ($(id -u)/$(id -g)) is the only provably-safe dynamic here.
+PERM_CMD = re.compile(r"\b(?:chmod|chgrp|chown|setfacl|install)\b([^|;&\n]*)")
+OWNERSHIP_IDIOMS = (
+    "$(id -u):$(id -g)", "$(id -un):$(id -gn)", "$(id -u)", "$(id -g)",
+    "$(id -un)", "$(id -gn)",
+)
 
 DOCKER_RUN = re.compile(r"\bdocker\s+run\b")
 
-# systemd unit files DO support backslash continuation and whitespace around `=`,
-# so DeviceAllow lines are matched after continuation-joining with a tolerant head.
-DEVICE_ALLOW = re.compile(r"\s*DeviceAllow\s*=\s*(.*)$")
-DEVICE_ALLOW_UINPUT = re.compile(r"/dev/uinput")
-DEVICE_ALLOW_INPUT = re.compile(r"/dev/input(?![A-Za-z0-9_.-])")
+# Docker flags that never take a value. Any OTHER unknown `-flag` consumes the
+# following non-dash word as its value (fail closed: a mis-parsed value could
+# otherwise be mistaken for the image operand and end option parsing too early).
+DOCKER_BOOL_FLAGS = {
+    "--rm", "--privileged", "--init", "--read-only", "--detach", "-d",
+    "--interactive", "-i", "--tty", "-t", "-it", "--publish-all", "-P",
+    "--no-healthcheck", "--sig-proxy",
+}
+
+# Single-char boolean shorthands pflag may combine ahead of an attached value
+# (`-tv/dev:/dev` == `-t -v /dev:/dev`).
+SHORT_BOOL_FLAGS = frozenset(
+    f for f in DOCKER_BOOL_FLAGS if len(f) == 2 and not f.startswith("--")
+)
 
 
 def logical_lines(text):
@@ -113,14 +174,211 @@ def logical_lines(text):
         i += 1
 
 
+def raw_word_flags(line):
+    """One bool per whitespace-separated shell word: True when the word carries a
+    `$` or backtick OUTSIDE any quotes. Unquoted expansions word-split at runtime,
+    so a single token like $FLAGS or $(route_args) can inject WHOLE docker options;
+    quoted expansions ("$IMG") stay one word and cannot. Aligned 1:1 with the
+    shlex.split() tokens of the same line (callers must verify the lengths)."""
+    flags = []
+    have_word = False
+    unquoted_dyn = False
+    in_single = in_double = esc = False
+    for ch in line:
+        if esc:
+            esc = False
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_double = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == "'":
+            have_word = True
+            in_single = True
+            continue
+        if ch == '"':
+            have_word = True
+            in_double = True
+            continue
+        if ch.isspace():
+            if have_word:
+                flags.append(unquoted_dyn)
+            have_word = False
+            unquoted_dyn = False
+            continue
+        have_word = True
+        if ch in "$`":
+            unquoted_dyn = True
+    if have_word:
+        flags.append(unquoted_dyn)
+    return flags
+
+
+def attached_short_pair(tok):
+    """Split docker's attached-value short-option spelling into (flag, value);
+    None when tok is not one. `-v/dev:/dev` -> ("-v", "/dev:/dev"); pflag also
+    accepts `-v=/dev:/dev` and combined shorthands (`-tv/dev:/dev`)."""
+    if not tok.startswith("-") or tok.startswith("--"):
+        return None
+    body = tok[1:]
+    while body:
+        flag = "-" + body[0]
+        if flag in SHORT_VALUE_FLAGS:
+            if len(body) < 2:
+                return None
+            value = body[1:]
+            if value.startswith("="):
+                value = value[1:]
+            return flag, value
+        if flag in SHORT_BOOL_FLAGS:
+            body = body[1:]
+            continue
+        return None
+    return None
+
+
+def docker_regions(tokens):
+    """Split one `docker run` token list into (option_tokens, image_idx, app_tokens).
+    The image is the first positional operand after `docker run`; everything after it
+    is the container command + arguments (inert as far as Docker option parsing goes).
+    image_idx is None when no positional operand exists."""
+    try:
+        start = tokens.index("run", tokens.index("docker"))
+    except ValueError:
+        return tokens, None, []
+    i = start + 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.startswith("-"):
+            if tok in DOCKER_BOOL_FLAGS or "=" in tok or attached_short_pair(tok):
+                i += 1  # self-contained (boolean, inline `=`, or attached value)
+            elif i + 1 < n and not tokens[i + 1].startswith("-"):
+                i += 2  # flag value (sensitive or unknown)
+            else:
+                i += 1
+            continue
+        return tokens[:i], i, tokens[i + 1:]
+    return tokens, None, []
+
+
+def bind_source_denied(src):
+    """True when a STATIC bind source exposes protected host device/seat paths."""
+    if src in PROTECTED_BIND_SOURCES:
+        return True
+    if RUN_USER_RE.match(src):
+        return True
+    norm = src.rstrip("/")
+    if not norm:  # src == "/" (or "//")
+        return True
+    return any(p.startswith(norm + "/") for p in PROTECTED_BIND_SOURCES)
+
+
+def workspace_bind_ok(src):
+    return src in WORKSPACE_EXACT or src.startswith(WORKSPACE_PREFIXES)
+
+
+def cgroup_rule_denied(value):
+    """True when a --device-cgroup-rule value can reach an input/uinput node,
+    including wildcard grants. Unparseable rules fail closed (denied)."""
+    norm = " ".join(value.split())
+    m = CGROUP_RULE.match(norm)
+    if not m:
+        return True
+    _typ, major, minor = m.groups()
+    if major in ("*", "13"):
+        return True
+    if major == "10" and minor in ("*", "223"):
+        return True
+    return False
+
+
+def mount_src_of(value):
+    """Extract the src= field of a --mount value (empty string when absent)."""
+    for field in value.split(","):
+        if field.startswith("src=") or field.startswith("source="):
+            return field.split("=", 1)[1]
+    return ""
+
+
+def check_sensitive_value(flag, value, lineno, findings):
+    """Deny model for one docker option value (both `--flag value` and `--flag=value`)."""
+    if flag == "--device-cgroup-rule":
+        if DYNAMIC.search(value):
+            findings.append(("dynamic_route", lineno, f"{flag} {value!r}"))
+        elif cgroup_rule_denied(value):
+            findings.append(("input_major_wildcard", lineno, value))
+        return
+    if flag == "--device":
+        if DYNAMIC.search(value):
+            findings.append(("dynamic_route", lineno, f"{flag} {value!r}"))
+        return
+    if flag == "--cap-add":
+        if DYNAMIC.search(value):
+            findings.append(("dynamic_route", lineno, f"{flag} {value!r}"))
+        return
+    if flag in BIND_FLAGS:
+        src = mount_src_of(value) if flag == "--mount" else value.split(":", 1)[0]
+        if DYNAMIC.search(value):
+            if not workspace_bind_ok(src):
+                findings.append(("dynamic_route", lineno, f"{flag} {value!r}"))
+            return
+        if bind_source_denied(src):
+            findings.append(("host_path_bind", lineno, value))
+        return
+    if flag in ("-e", "--env"):
+        if DYNAMIC.search(value):
+            findings.append(("dynamic_route", lineno, f"{flag} {value!r}"))
+        # A static bare `-e NAME` passes the host env var through; a display
+        # variable NAME is already caught by TOKEN_RULES on the literal token.
+        return
+
+
+def token_findings(tok, lineno):
+    """Literal-token denials for one argv token (used for plain tokens AND for
+    option values consumed positionally, so `--device /dev/uinput` is never skipped)."""
+    out = []
+    for rule, pat in TOKEN_RULES:
+        if pat.search(tok):
+            out.append((rule, lineno, tok))
+    if ARRAY_EXPANSION.search(tok):
+        out.append(("dynamic_route", lineno,
+                    f"unprovable array expansion in docker argv: {tok}"))
+    return out
+
+
 def scan_text(text):
-    """argv + text scan; returns list of (rule, lineno, detail)."""
+    """Return findings: list of (rule, lineno, detail)."""
     findings = []
     for lineno, line in logical_lines(text):
         for rule, pat in TEXT_RULES:
             m = pat.search(line)
             if m:
                 findings.append((rule, lineno, m.group(0)))
+        m = ASSIGN_RULE.search(line)
+        if m:
+            value = m.group(1)
+            for pat, rule in ASSIGN_VALUE_RULE:
+                if pat.match(value):
+                    findings.append((rule, lineno, m.group(0).strip()))
+                    break
+        for pm in PERM_CMD.finditer(line):
+            rest = pm.group(1)
+            for idiom in OWNERSHIP_IDIOMS:
+                rest = rest.replace(idiom, "")
+            if DYNAMIC.search(rest):
+                findings.append(("dynamic_route", lineno,
+                                 "permission command with dynamic argument: "
+                                 + pm.group(0).strip()[:60]))
         if not DOCKER_RUN.search(line):
             continue
         try:
@@ -128,26 +386,133 @@ def scan_text(text):
         except ValueError as exc:
             findings.append(("unparseable_command", lineno, str(exc)))
             continue
+        raws = raw_word_flags(line)
+        if len(raws) != len(tokens):
+            # The quote-aware word walk and shlex disagree -> the argv cannot be
+            # proven safe statically. Fail closed.
+            findings.append(("unparseable_command", lineno,
+                             "word/token misalignment in docker run line"))
+            continue
+        # The Docker option region starts AFTER the `docker run` tokens; a shell
+        # prefix on the same logical line (`for suite ...; do`, `if`, `caps() {`)
+        # is not part of the argv and must not be mistaken for the image operand.
+        try:
+            run_idx = tokens.index("run", tokens.index("docker"))
+        except ValueError:
+            run_idx = None
         i = 0
         n = len(tokens)
+        image_seen = False
         while i < n:
             tok = tokens[i]
-            for rule, pat in TOKEN_RULES:
-                if pat.search(tok):
-                    findings.append((rule, lineno, tok))
-            if tok == "--device-cgroup-rule":
-                if i + 1 >= n:
-                    findings.append(("unparseable_command", lineno, "truncated --device-cgroup-rule"))
-                elif CGROUP_MAJOR13.match(tokens[i + 1]):
-                    findings.append(("input_major_wildcard", lineno, tokens[i + 1]))
-            elif tok.startswith("--device-cgroup-rule="):
-                value = tok.split("=", 1)[1]
-                if CGROUP_MAJOR13.match(value):
-                    findings.append(("input_major_wildcard", lineno, value))
-            if tok in PAIR_FLAGS and i + 1 >= n:
-                findings.append(("unparseable_command", lineno, f"truncated {tok}"))
+            findings.extend(token_findings(tok, lineno))
+            if run_idx is None or i <= run_idx:
+                i += 1
+                continue
+            if tok == "--privileged":
+                findings.append(("host_device_wildcard", lineno, tok))
+            if tok == "--env-file" or tok.startswith("--env-file="):
+                findings.append(("host_env_file", lineno, tok))
+            apair = attached_short_pair(tok)
+            if apair is not None:
+                # Attached short-option spelling (`-v/dev:/dev`, `-eDISPLAY`):
+                # split, then run the SAME deny model as the spaced spelling.
+                flag, value = apair
+                findings.extend(token_findings(value, lineno))
+                check_sensitive_value(flag, value, lineno, findings)
+                if not image_seen and raws[i]:
+                    findings.append(("dynamic_route", lineno,
+                                     "unquoted expansion attached to "
+                                     f"{flag} can word-split into extra docker "
+                                     f"options: {tok}"))
+                i += 1
+                continue
+            consumed = False
+            for flag in SENSITIVE_VALUE_FLAGS:
+                if tok == flag:
+                    if i + 1 >= n:
+                        findings.append(("unparseable_command", lineno, f"truncated {tok}"))
+                    else:
+                        value = tokens[i + 1]
+                        # A consumed option value must still face the literal-token
+                        # denials, else `--device /dev/uinput` hides in the value slot.
+                        findings.extend(token_findings(value, lineno))
+                        check_sensitive_value(flag, value, lineno, findings)
+                        if not image_seen and raws[i + 1]:
+                            findings.append(("dynamic_route", lineno,
+                                             "unquoted expansion as the value of "
+                                             f"{tok} can word-split into extra "
+                                             f"docker options: {value}"))
+                        i += 1
+                        consumed = True
+                    break
+                if tok.startswith(flag + "="):
+                    check_sensitive_value(flag, tok.split("=", 1)[1], lineno, findings)
+                    consumed = True  # inline form carries its own value
+                    break
+            if consumed:
+                i += 1
+                continue
+            if not image_seen:
+                # Everything before the first positional operand is the Docker
+                # OPTION region. An unquoted expansion here ($FLAGS, ${FLAGS},
+                # $(cmd), `cmd`) word-splits at runtime and can inject ANY option
+                # (--privileged, --device, binds, env) past this static scan.
+                if raws[i]:
+                    findings.append(("dynamic_route", lineno,
+                                     "unquoted shell expansion in the docker option "
+                                     "region can inject arbitrary options at runtime: "
+                                     f"{tok}"))
+                elif tok.startswith("-"):
+                    # Unknown non-boolean flag: its value is the next non-dash word.
+                    if ("=" not in tok and tok not in DOCKER_BOOL_FLAGS
+                            and i + 1 < n and not tokens[i + 1].startswith("-")):
+                        findings.extend(token_findings(tokens[i + 1], lineno))
+                        if raws[i + 1]:
+                            findings.append(("dynamic_route", lineno,
+                                             "unquoted expansion as the value of "
+                                             f"{tok} can word-split into extra "
+                                             f"docker options: {tokens[i + 1]}"))
+                        i += 1
+                else:
+                    image_seen = True  # first positional operand = the image
             i += 1
     return findings
+
+
+def docker_run_commands(text):
+    """Return the shlex token lists of every joined `docker run` logical line."""
+    cmds = []
+    for _lineno, line in logical_lines(text):
+        if not DOCKER_RUN.search(line):
+            continue
+        try:
+            cmds.append(shlex.split(line, comments=False))
+        except ValueError:
+            cmds.append(None)  # unparseable: scan_text already reported it
+    return cmds
+
+
+def pair_ok(tokens, flag, value):
+    """True when `value` is the option value of `flag` (adjacent or --flag=value),
+    not merely present somewhere in the argv."""
+    for i, tok in enumerate(tokens):
+        if tok == flag and i + 1 < len(tokens) and tokens[i + 1] == value:
+            return True
+        if tok == f"{flag}={value}":
+            return True
+    return False
+
+
+CHECK_SUITE_TOKEN = re.compile(r"check-(?:\$suite|\$?\{?suite\}?|control|sensor|skin)")
+
+
+# ---------------------------------------------------------------- DeviceAllow
+# systemd unit files DO support backslash continuation and whitespace around `=`,
+# so DeviceAllow lines are matched after continuation-joining with a tolerant head.
+DEVICE_ALLOW = re.compile(r"\s*DeviceAllow\s*=\s*(.*)$")
+DEVICE_ALLOW_UINPUT = re.compile(r"/dev/uinput")
+DEVICE_ALLOW_INPUT = re.compile(r"/dev/input(?![A-Za-z0-9_.-])")
 
 
 def scan_device_allow(text):
@@ -163,18 +528,6 @@ def scan_device_allow(text):
         elif DEVICE_ALLOW_INPUT.search(value):
             findings.append(("host_input_bind", lineno, value.strip()))
     return findings
-
-
-def docker_run_commands(text):
-    cmds = []
-    for _lineno, line in logical_lines(text):
-        if not DOCKER_RUN.search(line):
-            continue
-        try:
-            cmds.append(shlex.split(line, comments=False))
-        except ValueError:
-            cmds.append(None)
-    return cmds
 
 
 def structural_checks(text, label):
@@ -194,15 +547,27 @@ def structural_checks(text, label):
         problems.append(f"{label}: build step missing")
     if "upload-artifact" not in text:
         problems.append(f"{label}: evidence upload missing")
-    wrapper_runs = [t for t in docker_run_commands(text)
-                    if t and any("run-under-sim.py" in tok for tok in t)]
+    wrapper_runs = []
+    for tokens in docker_run_commands(text):
+        if tokens is None:
+            continue
+        opts, image_idx, application = docker_regions(tokens)
+        if image_idx is not None and any("run-under-sim.py" in tok for tok in application):
+            wrapper_runs.append((opts, application))
     if not wrapper_runs:
-        problems.append(f"{label}: no docker run invokes run-under-sim.py (positive control)")
-    for tokens in wrapper_runs:
-        if "--cap-add" not in tokens or "SYS_ADMIN" not in tokens:
-            problems.append(f"{label}: wrapper run lost the nesting caps (SYS_ADMIN)")
-        if "--network" not in tokens or "none" not in tokens:
-            problems.append(f"{label}: wrapper run lost --network none")
+        problems.append(f"{label}: no docker run invokes run-under-sim.py in the "
+                        "container-argument region (positive control)")
+    for opts, _application in wrapper_runs:
+        # Docker-side requirements must be OPTION/VALUE PAIRS before the image;
+        # the same strings after the image are inert application arguments.
+        if not pair_ok(opts, "--cap-add", "SYS_ADMIN"):
+            problems.append(f"{label}: wrapper run lost the paired --cap-add SYS_ADMIN "
+                            "nesting cap as a Docker option before the image")
+        if not pair_ok(opts, "--network", "none"):
+            problems.append(f"{label}: wrapper run lost the paired --network none "
+                            "isolation as a Docker option before the image")
+        if "--rm" not in opts:
+            problems.append(f"{label}: wrapper run lost --rm from the Docker option region")
     return problems
 
 
@@ -236,58 +601,181 @@ def yaml_checks(path):
 
 # ---------------------------------------------------------------- self-test fixtures
 SELF_TEST_FIXTURES = [
-    # (name, text, expect_rule_or_None) — argv/text scanner.
+    # (name, text, expect_rules) - argv/text scanner. expect_rules is the SET of
+    # rules that must fire (empty set = must scan clean). Hardened fixtures are
+    # converged verbatim with the platform guard (pocketforge-os/platform#354).
     ("red_device_split_continuation",
-     "run: |\n  docker run --rm --device \\\n    /dev/uinput \"$SIM_IMG\" shell -lc 'true'\n",
-     "host_uinput_device"),
+     "run: |\n  docker run --rm --device \\\n    /dev/uinput \"$IMG\" check-control a133\n",
+     {"host_uinput_device"}),
     ("red_device_equals_form",
      "run: docker run --rm --device=/dev/uinput img cmd\n",
-     "host_uinput_device"),
+     {"host_uinput_device"}),
     ("red_input_bind_v",
      "run: docker run --rm -v /dev/input:/dev/input img cmd\n",
-     "host_input_bind"),
+     {"host_input_bind"}),
     ("red_input_mount_long",
      "run: docker run --rm --mount type=bind,src=/dev/input,dst=/dev/input img cmd\n",
-     "host_input_bind"),
+     {"host_input_bind"}),
     ("red_cgroup_major13",
      'run: docker run --rm --device-cgroup-rule "c 13:* rmw" img cmd\n',
-     "input_major_wildcard"),
+     {"input_major_wildcard"}),
     ("red_cgroup_major13_spacing",
      "run: docker run --rm --device-cgroup-rule 'c  13:*  rmw' img cmd\n",
-     "input_major_wildcard"),
+     {"input_major_wildcard"}),
+    ("red_cgroup_misc_uinput_10_223",
+     'run: docker run --rm --device-cgroup-rule "c 10:223 rmw" img cmd\n',
+     {"input_major_wildcard"}),
+    ("red_cgroup_wildcard_major",
+     'run: docker run --rm --device-cgroup-rule "c *:* rmw" img cmd\n',
+     {"input_major_wildcard"}),
+    ("red_cgroup_wildcard_all",
+     'run: docker run --rm --device-cgroup-rule "a *:* rmw" img cmd\n',
+     {"input_major_wildcard"}),
+    ("red_privileged",
+     "run: docker run --rm --privileged img cmd\n",
+     {"host_device_wildcard"}),
+    ("red_parent_bind_dev",
+     "run: docker run --rm -v /dev:/dev img cmd\n",
+     {"host_path_bind"}),
+    ("red_parent_bind_tmp",
+     "run: docker run --rm -v /tmp:/tmp img cmd\n",
+     {"host_path_bind"}),
+    ("red_parent_bind_run_user",
+     "run: docker run --rm -v /run/user/1000:/run/user/1000 img cmd\n",
+     {"host_path_bind"}),
+    ("red_env_file",
+     "run: docker run --rm --env-file /etc/host.env img cmd\n",
+     {"host_env_file"}),
     ("red_display_env",
      'run: docker run --rm -e DISPLAY="$DISPLAY" img cmd\n',
-     "host_display_projection"),
+     {"host_display_projection"}),
     ("red_wayland_env",
      "run: docker run --rm -e WAYLAND_DISPLAY=wayland-0 img cmd\n",
-     "host_display_projection"),
+     {"host_display_projection"}),
     ("red_x11_socket_bind",
      "run: docker run --rm -v /tmp/.X11-unix:/tmp/.X11-unix img cmd\n",
-     "host_display_projection"),
+     {"host_display_projection"}),
     ("red_xauthority_bind",
      "run: docker run --rm -v /home/mm/.Xauthority:/root/.Xauthority:ro img cmd\n",
-     "host_display_projection"),
+     {"host_display_projection"}),
     ("red_wayland_socket_bind",
      "run: docker run --rm -v /run/user/1000/wayland-0:/tmp/wayland-0 img cmd\n",
-     "host_display_projection"),
+     {"host_display_projection"}),
     ("red_modprobe",
      "run: sudo modprobe uinput || true\n",
-     "host_uinput_permission"),
+     {"host_uinput_permission"}),
     ("red_sg_input",
      'run: sg input -c "./ci/run-under-sim.py --device a133"\n',
-     "host_uinput_permission"),
+     {"host_uinput_permission"}),
     ("red_chmod_node",
      "run: sudo chmod 0666 /dev/uinput\n",
-     "host_uinput_permission"),
+     {"host_uinput_permission"}),
     ("red_modules_load_persistence",
      "run: echo uinput | sudo tee /etc/modules-load.d/uinput.conf\n",
-     "host_uinput_permission"),
+     {"host_uinput_permission"}),
     ("red_xdotool",
      "run: xdotool key --clearmodifiers space\n",
-     "host_input_tool"),
+     {"host_input_tool"}),
     ("red_unparseable_fail_closed",
      "run: docker run --rm --device 'unbalanced img cmd\n",
-     "unparseable_command"),
+     {"unparseable_command"}),
+    # ---- shell-expansion / indirection reds: every protected class via a variable
+    ("red_dynamic_device_via_var",
+     'run: |\n  node=/dev/uinput\n  docker run --rm --device "$node" "$IMG" cmd\n',
+     {"host_uinput_device", "dynamic_route"}),
+    ("red_dynamic_input_bind_via_var",
+     'run: |\n  dst=/dev/input\n  docker run --rm -v "$dst:/x" "$IMG" cmd\n',
+     {"host_input_bind", "dynamic_route"}),
+    ("red_dynamic_cgroup_rule_via_var",
+     'run: |\n  rule="c 13:* rmw"\n  docker run --rm --device-cgroup-rule "$rule" "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_dynamic_display_env_via_var",
+     'run: |\n  d=DISPLAY\n  docker run --rm -e "$d=:0" "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_dynamic_x11_socket_via_var",
+     'run: |\n  XSOCK=/tmp/.X11-unix\n  docker run --rm -v "$XSOCK:/tmp/.X11-unix" "$IMG" cmd\n',
+     {"host_display_projection", "dynamic_route"}),
+    ("red_dynamic_modprobe_via_var",
+     'run: modprobe "$mod" || true\n',
+     {"dynamic_route"}),
+    ("red_dynamic_chmod_via_var",
+     'run: |\n  n=/dev/uinput\n  chmod 0666 "$n"\n',
+     {"host_uinput_device", "dynamic_route"}),
+    ("red_dynamic_tool_via_assign",
+     'run: |\n  t=xdotool\n  "$t" key space\n',
+     {"host_input_tool"}),
+    ("red_array_indirection",
+     'run: |\n  CAPS=(--device /dev/uinput)\n  docker run --rm "${CAPS[@]}" "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_dynamic_bind_non_workspace",
+     'run: |\n  SRC=/opt/pf\n  docker run --rm -v "$SRC/data:/data" "$IMG" cmd\n',
+     {"dynamic_route"}),
+    # ---- whole-argv expansion reds: an UNQUOTED expansion in the Docker option
+    # region word-splits at runtime and can inject any option past the static scan.
+    ("red_scalar_expansion_option_region",
+     'run: |\n  FLAGS=\'--privileged --device /dev/uinput\'\n'
+     '  docker run --rm $FLAGS "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_braced_scalar_expansion_option_region",
+     'run: docker run --rm ${FLAGS} "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_cmdsub_option_region",
+     'run: docker run --rm $(route_args) "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_backtick_option_region",
+     'run: docker run --rm `route_args` "$IMG" cmd\n',
+     {"dynamic_route"}),
+    ("red_unquoted_dynamic_image_slot",
+     "run: docker run --rm $IMG_VAR cmd\n",
+     {"dynamic_route"}),
+     ("red_unquoted_expansion_as_unknown_flag_value",
+      'run: docker run --rm --security-opt $OPT "$IMG" cmd\n',
+      {"dynamic_route"}),
+     # ---- attached-value short-option reds: docker accepts `-vVALUE` / `-eVALUE`
+     # as equivalent to the spaced spelling; they must face the same deny model.
+     ("red_attached_short_bind_parent_dev",
+      "run: docker run --rm -v/dev:/dev alpine true\n",
+      {"host_path_bind"}),
+     ("red_attached_short_bind_run_user",
+      "run: docker run --rm -v/run/user/1000:/run/user/1000 alpine true\n",
+      {"host_path_bind"}),
+     ("red_attached_short_bind_combined_bools",
+      "run: docker run -it -tv/tmp:/tmp alpine true\n",
+      {"host_path_bind"}),
+     ("red_attached_short_env_display_passthrough",
+      "run: docker run --rm -eDISPLAY alpine true\n",
+      {"host_display_projection"}),
+     ("red_attached_short_env_display_assign",
+      "run: docker run --rm -eWAYLAND_DISPLAY=wayland-0 alpine true\n",
+      {"host_display_projection"}),
+    # ---- greens
+    ("green_migrated_argv",
+     "run: |\n"
+     "  docker run --rm --network none \\\n"
+     "    --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
+     '    "$IMG" "check-control" $BLOCKING\n',
+     set()),
+    ("green_doc_only_prose",
+     "# input rides the sim's private per-run FIFOs; the host kernel node is never opened,\n"
+     "# bound, or module-loaded, and no seat variable is projected (incident tsp-ihne1.56.5).\n",
+     set()),
+    ("green_workspace_chown_reclaim",
+     'run: docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
+     set()),
+     ("green_workspace_child_binds",
+      'run: docker run --rm --network none -v "$PWD/build:/app-build:ro" '
+      '-v "$PWD/evidence:/evidence" "$SIM_IMG" shell -lc \'python3 /app-ci/run.py --platform "$PLATFORM"\'\n',
+      set()),
+     ("green_attached_workspace_bind",
+      'run: docker run --rm "-v$PWD/build:/app-build:ro" "$SIM_IMG" shell -lc "python3 /app-ci/run.py"\n',
+      set()),
+    ("green_static_benign_bind",
+     "run: docker run --rm -v /opt/pf/platform:/platform:ro img cmd\n",
+     set()),
+    ("green_cgroup_benign_rule",
+     'run: docker run --rm --device-cgroup-rule "c 1:3 rw" img cmd\n',
+     set()),
+    # ---- pf-app-specific green: the exact migrated wrapper invocation.
     ("green_migrated_wrapper_argv",
      "run: |\n"
      '  mkdir -p "evidence/a133"\n'
@@ -304,14 +792,38 @@ SELF_TEST_FIXTURES = [
      "      --qemu-tsp \"$QEMU_TSP\" \\\n"
      "      --rootfs \"$ROOTFS\" \\\n"
      "      --outdir \"/evidence/a133\"'\n",
-     None),
-    ("green_doc_only_prose",
-     "# input rides the sim's private per-run FIFOs; the host kernel node is never opened,\n"
-     "# bound, or module-loaded, and no seat variable is projected (incident tsp-ihne1.56.5).\n",
-     None),
-    ("green_workspace_chown_reclaim",
-     'run: docker run --rm -v "$PWD:/w" debian:bookworm chown -R "$(id -u):$(id -g)" /w || true\n',
-     None),
+     set()),
+]
+
+# Structural positive-control fixtures for the wrapper invocation:
+# (name, text, expect_problems). Degraded spellings relocate a Docker-side
+# requirement after the image (inert application argument) or delete it.
+WRAPPER_CONTROL_GREEN = (
+    "jobs:\n"
+    "  sim:\n"
+    "    runs-on: [self-hosted, pf-builder-vm]\n"
+    "    steps:\n"
+    "      - run: ./build.sh\n"
+    '      - run: docker build -t "$SIM_IMG" .cache/sim\n'
+    "      - run: |\n"
+    "          docker run --rm --network none \\\n"
+    "            --cap-add SYS_ADMIN --security-opt apparmor=unconfined --security-opt seccomp=unconfined \\\n"
+    '            -v "$PWD/build:/app-build:ro" -v "$PWD/ci:/app-ci:ro" -v "$PWD/evidence:/evidence" \\\n'
+    "            \"$SIM_IMG\" shell -lc 'python3 /app-ci/run-under-sim.py --device a133 \\\n"
+    '              --binary /app-build/smoke-a133.arm64 --sim /opt/sim --platform "$PLATFORM" \\\n'
+    "              --qemu-tsp \"$QEMU_TSP\" --rootfs \"$ROOTFS\" --outdir /evidence/a133'\n"
+    "      - uses: actions/upload-artifact@v4\n"
+)
+WRAPPER_CONTROL_FIXTURES = [
+    ("ctrl_green_wrapper", WRAPPER_CONTROL_GREEN, False),
+    ("ctrl_red_wrapper_cap_spoofed_after_image",
+     WRAPPER_CONTROL_GREEN.replace("--cap-add SYS_ADMIN ", "")
+     .replace("run-under-sim.py", "run-under-sim.py --cap-add SYS_ADMIN"), True),
+    ("ctrl_red_wrapper_network_spoofed_after_image",
+     WRAPPER_CONTROL_GREEN.replace("--network none ", "")
+     .replace("run-under-sim.py", "run-under-sim.py --network none"), True),
+    ("ctrl_red_wrapper_rm_missing",
+     WRAPPER_CONTROL_GREEN.replace("docker run --rm", "docker run"), True),
 ]
 
 DEVICE_ALLOW_FIXTURES = [
@@ -333,16 +845,27 @@ def run_self_test():
     for name, text, expect in SELF_TEST_FIXTURES:
         found = scan_text(text)
         rules = {rule for rule, _ln, _d in found}
-        if expect is None:
+        if not expect:
             if found:
                 failures.append(f"{name}: expected PASS, got findings {sorted(rules)}")
             else:
                 print(f"self-test {name}: PASS (green control clean)")
         else:
-            if expect in rules:
-                print(f"self-test {name}: PASS (caught {expect})")
+            missing = expect - rules
+            if missing:
+                failures.append(f"{name}: expected rules {sorted(expect)}, "
+                                f"got {sorted(rules) or 'no findings'}")
             else:
-                failures.append(f"{name}: expected rule {expect}, got {sorted(rules) or 'no findings'}")
+                print(f"self-test {name}: PASS (caught {sorted(expect & rules)})")
+    for name, text, expect_problems in WRAPPER_CONTROL_FIXTURES:
+        problems = structural_checks(text, name)
+        if bool(problems) != expect_problems:
+            failures.append(f"{name}: expected problems={expect_problems}, "
+                            f"got {problems or 'none'}")
+        elif expect_problems:
+            print(f"self-test {name}: PASS (controls rejected: {problems[0][:70]}...)")
+        else:
+            print(f"self-test {name}: PASS (positive controls clean)")
     for name, text, expect in DEVICE_ALLOW_FIXTURES:
         found = scan_device_allow(text)
         rules = {rule for rule, _ln, _d in found}
@@ -356,14 +879,20 @@ def run_self_test():
                 print(f"self-test {name}: PASS (caught {expect})")
             else:
                 failures.append(f"{name}: expected rule {expect}, got {sorted(rules) or 'no findings'}")
-    total = len(SELF_TEST_FIXTURES) + len(DEVICE_ALLOW_FIXTURES)
+    total = (len(SELF_TEST_FIXTURES) + len(DEVICE_ALLOW_FIXTURES)
+             + len(WRAPPER_CONTROL_FIXTURES))
     if failures:
         for f in failures:
             print(f"host_route_guard=FAIL reason=self_test path=<fixture> line=0 rule=self_test detail={f}")
         print(f"SELF-TEST FAIL ({len(failures)} fixture(s) misbehaved)")
         return 1
-    reds = sum(1 for _n, _t, e in SELF_TEST_FIXTURES + [(n, t, e) for n, t, e in DEVICE_ALLOW_FIXTURES] if e)
-    print(f"SELF-TEST PASS ({total} fixtures: {reds} reds caught, {total - reds} greens clean)")
+    reds = (sum(1 for _n, _t, e in SELF_TEST_FIXTURES if e)
+            + sum(1 for _n, _t, e in DEVICE_ALLOW_FIXTURES if e)
+            + sum(1 for _n, _t, e in WRAPPER_CONTROL_FIXTURES if e))
+    greens = (sum(1 for _n, _t, e in SELF_TEST_FIXTURES if not e)
+              + sum(1 for _n, _t, e in DEVICE_ALLOW_FIXTURES if not e)
+              + sum(1 for _n, _t, e in WRAPPER_CONTROL_FIXTURES if not e))
+    print(f"SELF-TEST PASS ({total} fixtures: {reds} reds caught, {greens} greens/controls clean)")
     return 0
 
 
