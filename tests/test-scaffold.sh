@@ -2,8 +2,8 @@
 # tests/test-scaffold.sh — structural smoke for `pf-app new`.
 #
 # Scaffolds both families to a temp dir and asserts: the expected files exist, the
-# launch/build/sim/oci scripts are executable, no template token survives, and (if a
-# platform checkout is reachable) the emitted app.toml validates through `pf app-validate`.
+# launch/build/sim/oci scripts are executable, no template token survives, and (when
+# explicitly requested) the emitted app.toml validates through `pf app-validate`.
 # No network, no docker, no device.
 #
 # Usage:
@@ -18,13 +18,9 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass=0
 
-# Resolve a platform `pf` for the optional validate step: explicit env, else a sibling checkout.
+# Validation is opt-in: never bind this test's evidence to an ambient checkout on
+# a persistent runner or developer machine.
 PLATFORM_PF="${PLATFORM_PF:-}"
-if [ -z "$PLATFORM_PF" ]; then
-    for c in "$HERE/../platform/pf" "$HOME/platform/pf" "/tmp/platform-ref/pf"; do
-        [ -x "$c" ] && { PLATFORM_PF="$c"; break; }
-    done
-fi
 
 for dev in a133 a523; do
     out="$TMP/$dev"
@@ -63,5 +59,5 @@ for dev in a133 a523; do
     pass=$((pass + 1))
 done
 
-[ -n "$PLATFORM_PF" ] || echo "NOTE: platform 'pf' not found — skipped app-validate (set PLATFORM_PF=...)"
+[ -n "$PLATFORM_PF" ] || echo "NOTE: platform validation not requested — skipped app-validate (set PLATFORM_PF=...)"
 echo "PASS: $pass/2 families"

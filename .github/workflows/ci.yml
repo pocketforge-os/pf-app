@@ -75,6 +75,10 @@ jobs:
 
       - name: Run repository tests
         shell: bash
+        env:
+          # Exact-head evidence must never select a validator from a persistent
+          # runner's adjacent, home or temporary-directory checkout.
+          PLATFORM_PF: ""
         run: |
           set -euo pipefail
           mapfile -t tests < <(find tests -maxdepth 1 -type f -name 'test-*.sh' -print | LC_ALL=C sort)
