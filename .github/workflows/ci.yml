@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pf-app-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  external-fork-guard:
+    # Classify every event without scheduling untrusted forks on self-hosted
+    # infrastructure. Internal events therefore produce a green (not skipped)
+    # check that the merge gate can require.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Admit only same-repository changes to self-hosted tests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ] && [ "$HEAD_REPOSITORY" != "$BASE_REPOSITORY" ]; then
+            echo "Pull requests from forked repositories are not built on self-hosted runners."
+            echo "A maintainer must review the diff and test a same-repository branch."
+            exit 1
+          fi
+          echo "same_repository_guard=PASS"
+
+  tests:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, pf-public-ci]
+    # archlinux:base-devel as resolved on 2026-10-11; shared with the public
+    # wlroots build and pinned by registry digest.
+    container: library/archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+    timeout-minutes: 15
+    steps:
+      - name: Install test dependencies
+        run: |
+          pacman-key --init
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git python python-yaml
+
+      - name: Check out the exact tested revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          submodules: false
+
+      - name: Verify exact-head checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          actual="$(git rev-parse HEAD)"
+          expected="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          printf 'checked_out=%s expected=%s\n' "$actual" "$expected"
+          test "$actual" = "$expected"
+
+      - name: Check Python sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for name in ("core/scaffold.py", "templates/app/ci/run-under-sim.py.in"):
+              source = Path(name).read_text(encoding="utf-8")
+              compile(source, name, "exec")
+              print(f"python_compile=PASS path={name}")
+          PY
+
+      - name: Run repository tests
+        shell: bash
+        env:
+          # Exact-head evidence must never select a validator from a persistent
+          # runner's adjacent, home or temporary-directory checkout.
+          PLATFORM_PF: ""
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(find tests -maxdepth 1 -type f -name 'test-*.sh' -print | LC_ALL=C sort)
+          test "${#tests[@]}" -gt 0
+          for test_path in "${tests[@]}"; do
+            printf 'test_start=%s\n' "$test_path"
+            bash "$test_path"
+          done
+
+          scanner=tests/uinput_inventory.py
+          source_manifest=tests/fixtures/host-route-policy-v1.SOURCE
+          if [ -e "$scanner" ] || [ -e "$source_manifest" ]; then
+            test -f "$scanner"
+            test -f "$source_manifest"
+            python3 "$scanner" --self-test
+            python3 "$scanner"
+          fi
+
+      - name: Require tests to leave the checkout unchanged
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code --stat HEAD
+          test -z "$(git status --porcelain)"
