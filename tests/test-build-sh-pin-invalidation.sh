@@ -121,8 +121,17 @@ cd "$TMP/app"
 BIN="build/smoke-a133.arm64"
 content() { cat "$1"; }
 
+# GitHub Actions exports GITHUB_WORKSPACE for the checked-out pf-app source,
+# while this test builds a rendered app under RUNNER_TEMP. Seed a conflicting
+# ambient value and require run_build to bind the scaffold to its own root;
+# otherwise build.sh can succeed while depositing every artifact outside the
+# test tree (the exact-head CI failure on tsp-ihne1.56.5-b-port).
+AMBIENT_WORKSPACE="$TMP/ambient-workspace"
+mkdir -p "$AMBIENT_WORKSPACE"
+export GITHUB_WORKSPACE="$AMBIENT_WORKSPACE"
+
 run_build() {
-  PATH="$SHIM:$PATH" bash ./build.sh >"$TMP/build-run.log" 2>&1 || {
+  GITHUB_WORKSPACE="$PWD" PATH="$SHIM:$PATH" bash ./build.sh >"$TMP/build-run.log" 2>&1 || {
     echo "build.sh FAILED:"; tail -20 "$TMP/build-run.log"; return 1;
   }
 }
@@ -133,6 +142,9 @@ for f in build/deps/libpocketforge.a build/deps/libSDL3.a "$BIN" \
          build/deps/.libpocketforge.runtime-sha build/deps/.libSDL3.sim-sha build/.linked-pins; do
   [ -f "$f" ] && ok "run1 produced $f" || fail "run1 missing $f"
 done
+[ ! -e "$AMBIENT_WORKSPACE/build" ] \
+  && ok "run1 ignored the conflicting ambient GITHUB_WORKSPACE" \
+  || fail "run1 wrote artifacts through the conflicting ambient GITHUB_WORKSPACE"
 pf1=$(content build/deps/libpocketforge.a); sdl1=$(content build/deps/libSDL3.a); bin1=$(content "$BIN")
 
 # Plant an ignored leftover in every cached source worktree: `git clean -ffd`
