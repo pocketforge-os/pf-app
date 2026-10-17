@@ -18,7 +18,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: [self-hosted, pf-builder-vm]
+    runs-on: [self-hosted, pf-public-ci]
     timeout-minutes: 5
     steps:
       - name: Refuse fork PR builds on self-hosted runners
@@ -31,7 +31,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, pf-builder-vm]
+    runs-on: [self-hosted, pf-public-ci]
     # archlinux:base-devel as resolved on 2026-10-11; shared with the public
     # wlroots build and pinned by registry digest.
     container: library/archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
