@@ -94,6 +94,9 @@ elif [[ "$script" == *libpocketforge.a* ]]; then
 else
   echo "shim-docker: unrecognized container script" >&2; exit 1
 fi
+# A successful warm build deliberately writes nothing. Do not leak the false
+# no-relink predicate above as the shim's process status.
+exit 0
 EOF
 cat > "$SHIM/make" <<'EOF'
 #!/usr/bin/env bash
