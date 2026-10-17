@@ -15,17 +15,25 @@ concurrency:
 
 jobs:
   external-fork-guard:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: [self-hosted, pf-public-ci]
+    # Classify every event without scheduling untrusted forks on self-hosted
+    # infrastructure. Internal events therefore produce a green (not skipped)
+    # check that the merge gate can require.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Refuse fork PR builds on self-hosted runners
+      - name: Admit only same-repository changes to self-hosted tests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
         run: |
-          echo "Pull requests from forked repositories are not built on self-hosted runners."
-          echo "A maintainer must review the diff and test a same-repository branch."
-          exit 1
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ] && [ "$HEAD_REPOSITORY" != "$BASE_REPOSITORY" ]; then
+            echo "Pull requests from forked repositories are not built on self-hosted runners."
+            echo "A maintainer must review the diff and test a same-repository branch."
+            exit 1
+          fi
+          echo "same_repository_guard=PASS"
 
   tests:
     if: >-
